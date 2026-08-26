@@ -32,7 +32,7 @@ def obtener_password_admin():
             valor = None
     return valor or "fanero2026"
 
-st.set_page_config(page_title="Fanero - Incentivos", layout="wide")
+st.set_page_config(page_title="Fanero - Incentivos", layout="wide", page_icon="logo_fanero.jpg")
 @st.cache_resource
 def _inicializar_base_de_datos():
     db.init_db()
@@ -272,11 +272,42 @@ def calcular_incentivo(incentivo: dict):
 # Interfaz
 # ---------------------------------------------------------------------
 
+try:
+    st.image("logo_fanero.jpg", width=220)
+except Exception:
+    pass
+
 st.title("Fanero - Gestion de Incentivos")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1. Cargar ventas", "2. Crear incentivo", "3. Calcular resultado", "4. Historial"
-])
+if "admin_autenticado" not in st.session_state:
+    st.session_state["admin_autenticado"] = False
+
+with st.sidebar:
+    st.subheader("Acceso administrador")
+    if st.session_state["admin_autenticado"]:
+        st.success("Sesion iniciada")
+        if st.button("Cerrar sesion"):
+            st.session_state["admin_autenticado"] = False
+            st.rerun()
+    else:
+        password_ingresada = st.text_input("Contraseña", type="password", key="password_admin")
+        if st.button("Iniciar sesion"):
+            if password_ingresada == obtener_password_admin():
+                st.session_state["admin_autenticado"] = True
+                st.rerun()
+            else:
+                st.error("Contraseña incorrecta.")
+        st.caption("Si eres BO, no necesitas iniciar sesion -- usa las pestañas de la derecha.")
+
+if st.session_state["admin_autenticado"]:
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Cargar ventas", "Crear incentivo", "Calcular resultado", "Historial"
+    ])
+else:
+    tab1 = None
+    tab2, tab3, tab4 = st.tabs([
+        "Crear incentivo", "Calcular resultado", "Historial"
+    ])
 
 @st.cache_data(show_spinner="Procesando archivo de ventas (puede tardar con archivos grandes)...")
 def _leer_y_normalizar_ventas(archivo_bytes):
@@ -285,34 +316,17 @@ def _leer_y_normalizar_ventas(archivo_bytes):
     return df_raw, df_normalizado
 
 
-# --- TAB 1: Cargar ventas ---
-with tab1:
-    if "admin_autenticado" not in st.session_state:
-        st.session_state["admin_autenticado"] = False
-
-    if not st.session_state["admin_autenticado"]:
-        st.subheader("Acceso restringido")
-        st.caption(
-            "Cargar ventas y el maestro de participantes es solo para el "
-            "administrador. Si eres BO, no necesitas entrar aqui -- ve "
-            "directo a 'Crear incentivo'."
-        )
-        password_ingresada = st.text_input("Contraseña", type="password", key="password_admin")
-        if st.button("Entrar"):
-            if password_ingresada == obtener_password_admin():
-                st.session_state["admin_autenticado"] = True
-                st.rerun()
-            else:
-                st.error("Contraseña incorrecta.")
-    else:
+# --- TAB 1: Cargar ventas (solo visible con sesion iniciada) ---
+if tab1:
+    with tab1:
         st.subheader("Cargar archivo de ventas")
         st.caption("Sube el excel con las columnas: ACTIVATIONTYPE, STATUS, LASTSTATUSMODDATE, "
-                   "REQUESTSTARTHOUR, LOGIN, PARTNER, LEADER, USERTYPE, DEPARTMENT, "
-                   "TIPO ACTIVACION, PORTABILIDAD, TARIFFPLANNAME")
+               "REQUESTSTARTHOUR, LOGIN, PARTNER, LEADER, USERTYPE, DEPARTMENT, "
+               "TIPO ACTIVACION, PORTABILIDAD, TARIFFPLANNAME")
 
         fecha_declarada = st.date_input(
-            "Fecha de las ventas que estas cargando (para verificacion)",
-            value=date.today(),
+        "Fecha de las ventas que estas cargando (para verificacion)",
+        value=date.today(),
         )
         archivo_ventas = st.file_uploader("Archivo de ventas (.xlsx)", type=["xlsx"], key="ventas")
 
@@ -383,15 +397,15 @@ with tab1:
         st.divider()
         st.subheader("Maestro de participantes (opcional)")
         st.caption(
-            "Complemento para enriquecer los resultados con nombre, lider, gestor, etc. "
-            "Sube el archivo tal cual lo exportas (con columnas como NUMERODEDOCUMENTO, PATERNO, "
-            "MATERNO, NOMBRES, TIPO, DEPARTAMENTO, DNILIDER, GESTOR, CLASE, CLASIFICACION, etc.). "
-            "Al subir un archivo nuevo, se actualiza (no se duplica) la informacion de "
-            "cada LOGIN que ya exista."
+        "Complemento para enriquecer los resultados con nombre, lider, gestor, etc. "
+        "Sube el archivo tal cual lo exportas (con columnas como NUMERODEDOCUMENTO, PATERNO, "
+        "MATERNO, NOMBRES, TIPO, DEPARTAMENTO, DNILIDER, GESTOR, CLASE, CLASIFICACION, etc.). "
+        "Al subir un archivo nuevo, se actualiza (no se duplica) la informacion de "
+        "cada LOGIN que ya exista."
         )
         fecha_maestro = st.date_input(
-            "Fecha del corte / incentivo al que corresponde este maestro",
-            value=date.today(),
+        "Fecha del corte / incentivo al que corresponde este maestro",
+        value=date.today(),
         )
         archivo_maestro = st.file_uploader("Archivo del maestro (.xlsx)", type=["xlsx"], key="maestro")
 
