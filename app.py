@@ -15,8 +15,22 @@ import pandas as pd
 import numpy as np
 import json
 import io
+import os
 from datetime import datetime, date, time
 import db
+
+
+def obtener_password_admin():
+    """Lee la contraseña de administrador desde Secrets (Streamlit Cloud)
+    o desde el .env local. Si no esta configurada en ningun lado, usa un
+    valor por defecto (avisa que hay que cambiarlo)."""
+    valor = os.environ.get("ADMIN_PASSWORD")
+    if not valor:
+        try:
+            valor = st.secrets["ADMIN_PASSWORD"]
+        except Exception:
+            valor = None
+    return valor or "fanero2026"
 
 st.set_page_config(page_title="Fanero - Incentivos", layout="wide")
 @st.cache_resource
@@ -273,172 +287,190 @@ def _leer_y_normalizar_ventas(archivo_bytes):
 
 # --- TAB 1: Cargar ventas ---
 with tab1:
-    st.subheader("Cargar archivo de ventas")
-    st.caption("Sube el excel con las columnas: ACTIVATIONTYPE, STATUS, LASTSTATUSMODDATE, "
-               "REQUESTSTARTHOUR, LOGIN, PARTNER, LEADER, USERTYPE, DEPARTMENT, "
-               "TIPO ACTIVACION, PORTABILIDAD, TARIFFPLANNAME")
+    if "admin_autenticado" not in st.session_state:
+        st.session_state["admin_autenticado"] = False
 
-    fecha_declarada = st.date_input(
-        "Fecha de las ventas que estas cargando (para verificacion)",
-        value=date.today(),
-    )
-    archivo_ventas = st.file_uploader("Archivo de ventas (.xlsx)", type=["xlsx"], key="ventas")
-
-    if archivo_ventas is not None:
-        try:
-            archivo_bytes = archivo_ventas.getvalue()
-            df_raw, df_normalizado = _leer_y_normalizar_ventas(archivo_bytes)
-
-            st.write(f"Filas leidas: {len(df_raw)} | Filas procesables: {len(df_normalizado)}")
-            st.write(f"Ventas validas (COMPLETADA + partner correcto): {df_normalizado['es_valida'].sum()}")
-
-            fechas_reales = sorted(df_normalizado["fecha"].dropna().unique().tolist())
-            fecha_declarada_str = str(fecha_declarada)
-            if fecha_declarada_str not in fechas_reales:
-                st.error(
-                    f"Elegiste la fecha {fecha_declarada_str}, pero el archivo NO tiene "
-                    f"ventas de ese dia. El archivo contiene fechas: "
-                    f"{', '.join(fechas_reales) if len(fechas_reales) <= 10 else f'{fechas_reales[0]} a {fechas_reales[-1]} ({len(fechas_reales)} dias)'}. "
-                    f"Verifica que sea el archivo correcto antes de continuar."
-                )
+    if not st.session_state["admin_autenticado"]:
+        st.subheader("Acceso restringido")
+        st.caption(
+            "Cargar ventas y el maestro de participantes es solo para el "
+            "administrador. Si eres BO, no necesitas entrar aqui -- ve "
+            "directo a 'Crear incentivo'."
+        )
+        password_ingresada = st.text_input("Contraseña", type="password", key="password_admin")
+        if st.button("Entrar"):
+            if password_ingresada == obtener_password_admin():
+                st.session_state["admin_autenticado"] = True
+                st.rerun()
             else:
-                st.success(f"El archivo si contiene ventas de la fecha {fecha_declarada_str}. Ok para continuar.")
+                st.error("Contraseña incorrecta.")
+    else:
+        st.subheader("Cargar archivo de ventas")
+        st.caption("Sube el excel con las columnas: ACTIVATIONTYPE, STATUS, LASTSTATUSMODDATE, "
+                   "REQUESTSTARTHOUR, LOGIN, PARTNER, LEADER, USERTYPE, DEPARTMENT, "
+                   "TIPO ACTIVACION, PORTABILIDAD, TARIFFPLANNAME")
 
-            st.dataframe(df_normalizado.head(20))
+        fecha_declarada = st.date_input(
+            "Fecha de las ventas que estas cargando (para verificacion)",
+            value=date.today(),
+        )
+        archivo_ventas = st.file_uploader("Archivo de ventas (.xlsx)", type=["xlsx"], key="ventas")
 
-            file_hash = db.calcular_hash_archivo(archivo_bytes)
-            ya_cargado = db.archivo_ya_cargado(file_hash)
+        if archivo_ventas is not None:
+            try:
+                archivo_bytes = archivo_ventas.getvalue()
+                df_raw, df_normalizado = _leer_y_normalizar_ventas(archivo_bytes)
 
-            if ya_cargado:
-                st.warning(
-                    f"Este archivo (byte por byte identico) ya fue cargado antes: "
-                    f"'{ya_cargado['file_name']}' el {ya_cargado['cargado_en']}. "
-                    f"Si de verdad quieres volver a cargarlo, cambia algo minimo en el "
-                    f"archivo o avisa para forzar la carga."
-                )
-            else:
-                hashes_nuevos = db.calcular_hashes_de_dataframe(df_normalizado)
-                cantidad_repetida = db.contar_hashes_existentes(hashes_nuevos)
+                st.write(f"Filas leidas: {len(df_raw)} | Filas procesables: {len(df_normalizado)}")
+                st.write(f"Ventas validas (COMPLETADA + partner correcto): {df_normalizado['es_valida'].sum()}")
 
-                excluir_repetidas = False
-                if cantidad_repetida > 0:
+                fechas_reales = sorted(df_normalizado["fecha"].dropna().unique().tolist())
+                fecha_declarada_str = str(fecha_declarada)
+                if fecha_declarada_str not in fechas_reales:
+                    st.error(
+                        f"Elegiste la fecha {fecha_declarada_str}, pero el archivo NO tiene "
+                        f"ventas de ese dia. El archivo contiene fechas: "
+                        f"{', '.join(fechas_reales) if len(fechas_reales) <= 10 else f'{fechas_reales[0]} a {fechas_reales[-1]} ({len(fechas_reales)} dias)'}. "
+                        f"Verifica que sea el archivo correcto antes de continuar."
+                    )
+                else:
+                    st.success(f"El archivo si contiene ventas de la fecha {fecha_declarada_str}. Ok para continuar.")
+
+                st.dataframe(df_normalizado.head(20))
+
+                file_hash = db.calcular_hash_archivo(archivo_bytes)
+                ya_cargado = db.archivo_ya_cargado(file_hash)
+
+                if ya_cargado:
                     st.warning(
-                        f"{cantidad_repetida} de las {len(df_normalizado)} filas de este archivo "
-                        f"son IDENTICAS (mismas 12 columnas) a ventas que ya estan cargadas. Esto "
-                        f"puede ser normal (dos ventas reales identicas por casualidad) o senal de "
-                        f"que este archivo se solapa con uno ya subido antes."
+                        f"Este archivo (byte por byte identico) ya fue cargado antes: "
+                        f"'{ya_cargado['file_name']}' el {ya_cargado['cargado_en']}. "
+                        f"Si de verdad quieres volver a cargarlo, cambia algo minimo en el "
+                        f"archivo o avisa para forzar la carga."
                     )
-                    excluir_repetidas = st.checkbox(
-                        f"Excluir esas {cantidad_repetida} filas repetidas de esta carga (recomendado si "
-                        f"sabes que este archivo se solapa en fechas con uno ya cargado)"
-                    )
+                else:
+                    hashes_nuevos = db.calcular_hashes_de_dataframe(df_normalizado)
+                    cantidad_repetida = db.contar_hashes_existentes(hashes_nuevos)
 
-                if st.button("Confirmar carga a la base de datos"):
-                    df_a_insertar = df_normalizado
-                    if excluir_repetidas:
-                        df_normalizado_con_hash = df_normalizado.copy()
-                        df_normalizado_con_hash["_hash_temp"] = hashes_nuevos
-                        ya_existentes_set = set(db.obtener_hashes_existentes(hashes_nuevos))
-                        df_a_insertar = df_normalizado_con_hash[
-                            ~df_normalizado_con_hash["_hash_temp"].isin(ya_existentes_set)
-                        ].drop(columns=["_hash_temp"])
+                    excluir_repetidas = False
+                    if cantidad_repetida > 0:
+                        st.warning(
+                            f"{cantidad_repetida} de las {len(df_normalizado)} filas de este archivo "
+                            f"son IDENTICAS (mismas 12 columnas) a ventas que ya estan cargadas. Esto "
+                            f"puede ser normal (dos ventas reales identicas por casualidad) o senal de "
+                            f"que este archivo se solapa con uno ya subido antes."
+                        )
+                        excluir_repetidas = st.checkbox(
+                            f"Excluir esas {cantidad_repetida} filas repetidas de esta carga (recomendado si "
+                            f"sabes que este archivo se solapa en fechas con uno ya cargado)"
+                        )
 
-                    insertadas, _ = db.insertar_ventas(df_a_insertar, file_hash, archivo_ventas.name)
-                    st.success(f"Se cargaron {insertadas} filas.")
-        except ValueError as e:
-            st.error(str(e))
+                    if st.button("Confirmar carga a la base de datos"):
+                        df_a_insertar = df_normalizado
+                        if excluir_repetidas:
+                            df_normalizado_con_hash = df_normalizado.copy()
+                            df_normalizado_con_hash["_hash_temp"] = hashes_nuevos
+                            ya_existentes_set = set(db.obtener_hashes_existentes(hashes_nuevos))
+                            df_a_insertar = df_normalizado_con_hash[
+                                ~df_normalizado_con_hash["_hash_temp"].isin(ya_existentes_set)
+                            ].drop(columns=["_hash_temp"])
 
-    st.divider()
-    st.subheader("Maestro de participantes (opcional)")
-    st.caption(
-        "Complemento para enriquecer los resultados con nombre, lider, gestor, etc. "
-        "Sube el archivo tal cual lo exportas (con columnas como NUMERODEDOCUMENTO, PATERNO, "
-        "MATERNO, NOMBRES, TIPO, DEPARTAMENTO, DNILIDER, GESTOR, CLASE, CLASIFICACION, etc.). "
-        "Al subir un archivo nuevo, se actualiza (no se duplica) la informacion de "
-        "cada LOGIN que ya exista."
-    )
-    fecha_maestro = st.date_input(
-        "Fecha del corte / incentivo al que corresponde este maestro",
-        value=date.today(),
-    )
-    archivo_maestro = st.file_uploader("Archivo del maestro (.xlsx)", type=["xlsx"], key="maestro")
-
-    if archivo_maestro is not None:
-        df_maestro_raw = pd.read_excel(archivo_maestro)
-
-        columnas_necesarias = [
-            "NUMERODEDOCUMENTO", "PATERNO", "MATERNO", "NOMBRES", "TIPO",
-            "DEPARTAMENTO", "DNILIDER", "GESTOR", "CLASE", "CLASIFICACION",
-        ]
-        faltantes_maestro = [c for c in columnas_necesarias if c not in df_maestro_raw.columns]
-
-        if faltantes_maestro:
-            st.error(f"Faltan columnas en el archivo del maestro: {', '.join(faltantes_maestro)}")
-        else:
-            df_m = pd.DataFrame()
-            df_m["LOGIN"] = df_maestro_raw["NUMERODEDOCUMENTO"].astype(str).str.strip()
-            df_m["USERNAME"] = (
-                df_maestro_raw["PATERNO"].fillna("").astype(str).str.strip() + " " +
-                df_maestro_raw["MATERNO"].fillna("").astype(str).str.strip() + " " +
-                df_maestro_raw["NOMBRES"].fillna("").astype(str).str.strip()
-            ).str.replace(r"\s+", " ", regex=True).str.strip()
-            df_m["USERTYPE"] = df_maestro_raw["TIPO"].astype(str).str.strip()
-            df_m["DEPARTMENT"] = df_maestro_raw["DEPARTAMENTO"].astype(str).str.strip().str.upper()
-            df_m["LEADER"] = df_maestro_raw["DNILIDER"].astype(str).str.strip()
-            df_m["GESTOR"] = df_maestro_raw["GESTOR"].astype(str).str.strip()
-            df_m["FECHA"] = str(fecha_maestro)
-            df_m["NIVEL"] = df_maestro_raw["CLASIFICACION"].astype(str).str.strip()
-            df_m["_CLASE"] = df_maestro_raw["CLASE"].astype(str).str.strip().str.upper()
-
-            # LEADER NAME: solo se busca entre las filas donde CLASE = LIDER
-            # (no cualquier fila que por casualidad tenga ese DNI en User).
-            solo_lideres = df_m[df_m["_CLASE"] == "LIDER"]
-            nombre_por_login_lider = dict(zip(solo_lideres["LOGIN"], solo_lideres["USERNAME"]))
-            df_m["LEADER NAME"] = df_m["LEADER"].map(nombre_por_login_lider).fillna("")
-            df_m = df_m.drop(columns=["_CLASE"])
-
-            st.write(f"Filas procesadas: {len(df_m)} | Lideres identificados: {len(solo_lideres)}")
-            st.dataframe(df_m.head(10))
-
-            if st.button("Confirmar carga del maestro"):
-                actualizados = db.cargar_maestro_participantes(df_m)
-                st.success(f"Maestro actualizado: {actualizados} participantes.")
-
-    st.divider()
-    with st.expander("Zona de peligro"):
-        total_ventas_actual = db.contar_ventas()
-        st.write(f"Ventas cargadas actualmente en la base de datos: **{total_ventas_actual}**")
-
-        st.markdown("**Ver y borrar por fecha especifica (mas seguro)**")
-        fechas_cargadas = db.listar_fechas_cargadas()
-        if fechas_cargadas:
-            df_fechas = pd.DataFrame(fechas_cargadas)
-            st.dataframe(df_fechas)
-
-            fecha_a_borrar = st.date_input("Elige una fecha para ver/borrar solo esas ventas", value=date.today())
-            fecha_a_borrar_str = str(fecha_a_borrar)
-            cantidad_en_fecha = db.contar_ventas_por_fecha(fecha_a_borrar_str)
-            st.write(f"Ventas cargadas para {fecha_a_borrar_str}: **{cantidad_en_fecha}**")
-
-            if cantidad_en_fecha > 0 and st.button(f"Borrar solo las ventas de {fecha_a_borrar_str}"):
-                borradas = db.borrar_ventas_por_fecha(fecha_a_borrar_str)
-                st.success(f"Se borraron {borradas} ventas de la fecha {fecha_a_borrar_str}.")
-        else:
-            st.caption("Todavia no hay ventas cargadas.")
+                        insertadas, _ = db.insertar_ventas(df_a_insertar, file_hash, archivo_ventas.name)
+                        st.success(f"Se cargaron {insertadas} filas.")
+            except ValueError as e:
+                st.error(str(e))
 
         st.divider()
-        st.markdown("**Borrar TODO (todas las fechas)**")
+        st.subheader("Maestro de participantes (opcional)")
         st.caption(
-            "Esto borra TODAS las ventas cargadas (no los incentivos ni sus resultados). "
-            "Usalo solo si de verdad quieres empezar de cero."
+            "Complemento para enriquecer los resultados con nombre, lider, gestor, etc. "
+            "Sube el archivo tal cual lo exportas (con columnas como NUMERODEDOCUMENTO, PATERNO, "
+            "MATERNO, NOMBRES, TIPO, DEPARTAMENTO, DNILIDER, GESTOR, CLASE, CLASIFICACION, etc.). "
+            "Al subir un archivo nuevo, se actualiza (no se duplica) la informacion de "
+            "cada LOGIN que ya exista."
         )
-        confirmacion = st.text_input("Escribe BORRAR para confirmar")
-        if st.button("Borrar todas las ventas cargadas", type="primary"):
-            if confirmacion.strip().upper() == "BORRAR":
-                db.borrar_todas_las_ventas()
-                st.success("Todas las ventas fueron borradas. Ya puedes cargar tu archivo limpio.")
+        fecha_maestro = st.date_input(
+            "Fecha del corte / incentivo al que corresponde este maestro",
+            value=date.today(),
+        )
+        archivo_maestro = st.file_uploader("Archivo del maestro (.xlsx)", type=["xlsx"], key="maestro")
+
+        if archivo_maestro is not None:
+            df_maestro_raw = pd.read_excel(archivo_maestro)
+
+            columnas_necesarias = [
+                "NUMERODEDOCUMENTO", "PATERNO", "MATERNO", "NOMBRES", "TIPO",
+                "DEPARTAMENTO", "DNILIDER", "GESTOR", "CLASE", "CLASIFICACION",
+            ]
+            faltantes_maestro = [c for c in columnas_necesarias if c not in df_maestro_raw.columns]
+
+            if faltantes_maestro:
+                st.error(f"Faltan columnas en el archivo del maestro: {', '.join(faltantes_maestro)}")
             else:
-                st.error("Escribe exactamente BORRAR (en mayusculas) en el cuadro de arriba para confirmar.")
+                df_m = pd.DataFrame()
+                df_m["LOGIN"] = df_maestro_raw["NUMERODEDOCUMENTO"].astype(str).str.strip()
+                df_m["USERNAME"] = (
+                    df_maestro_raw["PATERNO"].fillna("").astype(str).str.strip() + " " +
+                    df_maestro_raw["MATERNO"].fillna("").astype(str).str.strip() + " " +
+                    df_maestro_raw["NOMBRES"].fillna("").astype(str).str.strip()
+                ).str.replace(r"\s+", " ", regex=True).str.strip()
+                df_m["USERTYPE"] = df_maestro_raw["TIPO"].astype(str).str.strip()
+                df_m["DEPARTMENT"] = df_maestro_raw["DEPARTAMENTO"].astype(str).str.strip().str.upper()
+                df_m["LEADER"] = df_maestro_raw["DNILIDER"].astype(str).str.strip()
+                df_m["GESTOR"] = df_maestro_raw["GESTOR"].astype(str).str.strip()
+                df_m["FECHA"] = str(fecha_maestro)
+                df_m["NIVEL"] = df_maestro_raw["CLASIFICACION"].astype(str).str.strip()
+                df_m["_CLASE"] = df_maestro_raw["CLASE"].astype(str).str.strip().str.upper()
+
+                # LEADER NAME: solo se busca entre las filas donde CLASE = LIDER
+                # (no cualquier fila que por casualidad tenga ese DNI en User).
+                solo_lideres = df_m[df_m["_CLASE"] == "LIDER"]
+                nombre_por_login_lider = dict(zip(solo_lideres["LOGIN"], solo_lideres["USERNAME"]))
+                df_m["LEADER NAME"] = df_m["LEADER"].map(nombre_por_login_lider).fillna("")
+                df_m = df_m.drop(columns=["_CLASE"])
+
+                st.write(f"Filas procesadas: {len(df_m)} | Lideres identificados: {len(solo_lideres)}")
+                st.dataframe(df_m.head(10))
+
+                if st.button("Confirmar carga del maestro"):
+                    actualizados = db.cargar_maestro_participantes(df_m)
+                    st.success(f"Maestro actualizado: {actualizados} participantes.")
+
+        st.divider()
+        with st.expander("Zona de peligro"):
+            total_ventas_actual = db.contar_ventas()
+            st.write(f"Ventas cargadas actualmente en la base de datos: **{total_ventas_actual}**")
+
+            st.markdown("**Ver y borrar por fecha especifica (mas seguro)**")
+            fechas_cargadas = db.listar_fechas_cargadas()
+            if fechas_cargadas:
+                df_fechas = pd.DataFrame(fechas_cargadas)
+                st.dataframe(df_fechas)
+
+                fecha_a_borrar = st.date_input("Elige una fecha para ver/borrar solo esas ventas", value=date.today())
+                fecha_a_borrar_str = str(fecha_a_borrar)
+                cantidad_en_fecha = db.contar_ventas_por_fecha(fecha_a_borrar_str)
+                st.write(f"Ventas cargadas para {fecha_a_borrar_str}: **{cantidad_en_fecha}**")
+
+                if cantidad_en_fecha > 0 and st.button(f"Borrar solo las ventas de {fecha_a_borrar_str}"):
+                    borradas = db.borrar_ventas_por_fecha(fecha_a_borrar_str)
+                    st.success(f"Se borraron {borradas} ventas de la fecha {fecha_a_borrar_str}.")
+            else:
+                st.caption("Todavia no hay ventas cargadas.")
+
+            st.divider()
+            st.markdown("**Borrar TODO (todas las fechas)**")
+            st.caption(
+                "Esto borra TODAS las ventas cargadas (no los incentivos ni sus resultados). "
+                "Usalo solo si de verdad quieres empezar de cero."
+            )
+            confirmacion = st.text_input("Escribe BORRAR para confirmar")
+            if st.button("Borrar todas las ventas cargadas", type="primary"):
+                if confirmacion.strip().upper() == "BORRAR":
+                    db.borrar_todas_las_ventas()
+                    st.success("Todas las ventas fueron borradas. Ya puedes cargar tu archivo limpio.")
+                else:
+                    st.error("Escribe exactamente BORRAR (en mayusculas) en el cuadro de arriba para confirmar.")
 
 # --- TAB 2: Crear incentivo ---
 with tab2:
