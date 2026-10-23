@@ -56,10 +56,14 @@ def sin_tildes(texto) -> str:
     return "".join(ch for ch in t if not unicodedata.combining(ch)).strip().upper()
 
 
+def _txt(serie: pd.Series) -> pd.Series:
+    """Texto limpio; celdas vacías -> "" (pandas 3 conserva NaN al hacer astype(str))."""
+    s = serie.astype(object)
+    return s.where(s.notna(), "").map(str).str.strip().replace({"nan": "", "None": "", "<NA>": "", "NaT": ""})
+
+
 def _limpiar_id(serie: pd.Series) -> pd.Series:
-    s = serie.astype(str).str.strip()
-    s = s.str.replace(r"\.0$", "", regex=True).str.lstrip("'")
-    return s.replace({"nan": "", "None": "", "<NA>": ""})
+    return _txt(serie).str.replace(r"\.0$", "", regex=True).str.lstrip("'").str.strip()
 
 
 def _decodificar(contenido: bytes) -> str:
@@ -103,16 +107,16 @@ def normalizar(df: pd.DataFrame) -> pd.DataFrame:
     df["LEADER"] = _limpiar_id(df["LEADER"])
     for c in ("STATUS", "PROVINCIA", "DISTRITO", "CANAL", "USERTYPE", "PORTABILIDAD",
               "ACTIVATIONTYPE", "TARIFFPLANNAME", "PARTNER", "FUENTE UBICACION"):
-        df[c] = df[c].astype(str).str.strip().replace({"nan": None, "None": None})
+        df[c] = _txt(df[c]).replace({"": None})
     for c in ("TIPO ACTIVACION", "PRODUCTO", "DEPARTMENT"):
         df[c] = df[c].map(sin_tildes)
     for c in ("LATITUDE", "LONGITUDE"):
-        df[c] = pd.to_numeric(df[c].astype(str).str.replace("'", "", regex=False), errors="coerce")
+        df[c] = pd.to_numeric(_txt(df[c]).str.replace("'", "", regex=False), errors="coerce")
 
     df["REQUESTSTARTHOUR"] = pd.to_numeric(df["REQUESTSTARTHOUR"], errors="coerce").astype("Int64")
-    fecha = pd.to_datetime(df["LASTSTATUSMODDATE"].astype(str).str.strip().str[:10],
+    fecha = pd.to_datetime(_txt(df["LASTSTATUSMODDATE"]).str[:10],
                            dayfirst=True, errors="coerce")
-    hora = df["LASTSTATUSMODHOUR"].astype(str).str.strip()
+    hora = _txt(df["LASTSTATUSMODHOUR"])
     df["LASTSTATUSMODDATE"] = fecha.dt.date
     df["FECHA_HORA"] = pd.to_datetime(fecha.dt.strftime("%Y-%m-%d") + " " + hora, errors="coerce")
     df["FECHA_HORA"] = df["FECHA_HORA"].fillna(fecha)
@@ -181,7 +185,7 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
 
     df["DNI"] = _limpiar_id(df["DNI"])
     df["DNI_LIDER"] = _limpiar_id(df["DNI_LIDER"])
-    df["NOMBRE"] = df["NOMBRE"].fillna("").astype(str).str.strip()
+    df["NOMBRE"] = _txt(df["NOMBRE"])
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].map(sin_tildes)
     rol = df["ROL"].map(sin_tildes)
     df["ROL"] = rol.map(lambda r: "Vendedor" if r.startswith("VEND") else ("Líder" if r.startswith("LID") else None))
@@ -192,13 +196,12 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
     malos = ~sin_dni & df["ROL"].isna()
     if malos.any():
         raise ValueError("ROL debe ser Vendedor o Líder. Revisa los DNI: "
-                         + ", ".join(df.loc[malos, "DNI"].head(10)))
+                         + ", ".join(map(str, df.loc[malos, "DNI"].head(10))))
     df = df[~sin_dni]
 
     for p in PRODUCTOS:
         c = f"CUOTA_{slug(p)}"
-        txt = df[c].astype(object).where(df[c].notna(), "").astype(str).str.strip()
-        txt = txt.replace({"nan": "", "None": "", "<NA>": ""}).str.replace(r"\.0$", "", regex=True)
+        txt = _txt(df[c]).str.replace(r"\.0$", "", regex=True)
         num = pd.to_numeric(txt, errors="coerce")
         raros = (txt != "") & num.isna()
         if raros.any():
@@ -208,7 +211,7 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
     dup = df.duplicated(["DNI", "ROL"], keep="first")
     if dup.any():
         avisos.append(f"{int(dup.sum())} DNI repetido(s) con el mismo rol; se tomó la primera fila: "
-                      + ", ".join(df.loc[dup, "DNI"].head(10)))
+                      + ", ".join(map(str, df.loc[dup, "DNI"].head(10))))
         df = df[~dup]
     registros = df.astype(object).where(df.notna(), None).to_dict("records")
     return registros, avisos
@@ -271,7 +274,7 @@ def filtrar(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def _moda(serie: pd.Series) -> str:
-    s = serie[serie.astype(str) != ""]
+    s = serie[_txt(serie) != ""]
     m = s.mode()
     return m.iloc[0] if not m.empty else ""
 

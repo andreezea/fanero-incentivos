@@ -103,8 +103,8 @@ def leer_ventas(eng, desde=None, hasta=None) -> pd.DataFrame:
         df = pd.read_sql(q, cx)
     if df.empty:
         return pd.DataFrame(columns=core.COLUMNAS_REQUERIDAS + core.COLUMNAS_OPCIONALES + ["FECHA_HORA"])
-    df["login"] = df["login"].astype(str)
-    df["leader"] = df["leader"].fillna("").astype(str)
+    df["login"] = df["login"].fillna("").map(str)
+    df["leader"] = df["leader"].fillna("").map(str)
     return core.desde_bd(df)
 
 

@@ -341,7 +341,7 @@ with tab_res:
                 vista = vista[vista["GANA"] == "No"]
             if f_dni:
                 b = f_dni.strip()
-                vista = vista[vista["DNI"].str.contains(b, regex=False) | vista["LIDER"].str.contains(b, regex=False)
+                vista = vista[vista["DNI"].fillna("").str.contains(b, regex=False) | vista["LIDER"].fillna("").str.contains(b, regex=False)
                               | vista["NOMBRE"].fillna("").str.contains(b, case=False, regex=False)]
 
             def pintar(fila):
