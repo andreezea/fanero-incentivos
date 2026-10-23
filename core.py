@@ -153,7 +153,7 @@ def plantilla_participantes() -> bytes:
     ], columns=COLS_PARTICIPANTES)
     instrucciones = pd.DataFrame([
         ["DNI", "Obligatorio", "El número que sale en LOGIN (vendedor) o LEADER (líder) del Fanero"],
-        ["NOMBRE", "Obligatorio", "Nombre que saldrá en la matriz y en el Excel"],
+        ["NOMBRE", "Opcional", "Solo para identificarlo en la matriz y el Excel. Puede ir vacío"],
         ["ROL", "Obligatorio", "Vendedor o Líder. Si alguien compite en ambos, va en dos filas"],
         ["DEPARTAMENTO", "Opcional", "Departamento en el que compite. Vacío = donde más vende según el Fanero"],
         ["DNI_LIDER", "Opcional", "Solo vendedores: DNI de su líder. Vacío = el que figura en el Fanero"],
@@ -170,7 +170,7 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
     """Devuelve (participantes, avisos). Lanza ValueError si el archivo no sirve."""
     df = leer_tabla(nombre, contenido, hoja=0)
     df.columns = [sin_tildes(c).replace(" ", "_") for c in df.columns]
-    faltan = [c for c in ("DNI", "NOMBRE", "ROL") if c not in df.columns]
+    faltan = [c for c in ("DNI", "ROL") if c not in df.columns]
     if faltan:
         raise ValueError("Al archivo de participantes le faltan: " + ", ".join(faltan))
     for c in COLS_PARTICIPANTES:
