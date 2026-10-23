@@ -190,6 +190,13 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
     rol = df["ROL"].map(sin_tildes)
     df["ROL"] = rol.map(lambda r: "Vendedor" if r.startswith("VEND") else ("Líder" if r.startswith("LID") else None))
 
+    # Líder con DNI vacío pero con su número en DNI_LIDER: se toma de ahí
+    es_lider = df["ROL"] == "Líder"
+    mover = es_lider & (df["DNI"] == "") & (df["DNI_LIDER"] != "")
+    if mover.any():
+        df.loc[mover, "DNI"] = df.loc[mover, "DNI_LIDER"]
+    df.loc[es_lider, "DNI_LIDER"] = ""
+
     sin_dni = df["DNI"] == ""
     if sin_dni.any():
         avisos.append(f"{int(sin_dni.sum())} fila(s) sin DNI se ignoraron.")
