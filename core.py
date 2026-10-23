@@ -182,19 +182,24 @@ def plantilla_participantes() -> bytes:
     ejemplo = pd.DataFrame([
         ["40854375", "Juan Pérez", "Vendedor", "LORETO", "41544805", 5, "", 2, ""],
         ["62300640", "María Ríos", "Vendedor", "LORETO", "41544805", "", "", "", ""],
+        ["", "", "Vendedor", "", "40687294", 5, "", "", ""],
         ["41544805", "Carlos Soto", "Líder", "LORETO", "", 30, "", 10, ""],
     ], columns=COLS_PARTICIPANTES)
     instrucciones = pd.DataFrame([
-        ["DNI", "Obligatorio", "El número que sale en LOGIN (vendedor) o LEADER (líder) del Fanero"],
+        ["DNI", "Obligatorio*", "El número que sale en LOGIN (vendedor) o LEADER (líder) del Fanero. "
+                                "*Puede ir vacío si llenas DNI_LIDER (ver abajo)"],
         ["NOMBRE", "Opcional", "Solo para identificarlo en la matriz y el Excel. Puede ir vacío"],
         ["ROL", "Obligatorio", "Vendedor o Líder. Si alguien compite en ambos, va en dos filas"],
         ["DEPARTAMENTO", "Opcional", "Departamento en el que compite. Vacío = donde más vende según el Fanero"],
-        ["DNI_LIDER", "Opcional", "Solo vendedores: DNI de su líder. Vacío = el que figura en el Fanero"],
+        ["DNI_LIDER", "Opcional", "Vendedor CON DNI: su líder (vacío = el del Fanero). "
+                                  "Vendedor SIN DNI: participan TODOS los vendedores de ese líder según el Fanero, "
+                                  "cada uno con su DNI. Líder sin DNI: se toma este número como su DNI"],
         ["CUOTA_PREPAGO", "Opcional", "Cuota individual de prepago (TIPO ACTIVACION = PREPAGO). Vacío = cuota general del incentivo"],
         ["CUOTA_POSTPAGO", "Opcional", "Cuota individual de postpago (TIPO ACTIVACION = POSTPAGO). Vacío = cuota general"],
         ["CUOTA_PORTA_PREPAGO", "Opcional", "Cuota individual de porta prepago (PRODUCTO = PORTA PREPAGO). Vacío = cuota general"],
         ["CUOTA_OSS", "Opcional", "Cuota individual de OSS (PRODUCTO = OSS). Vacío = cuota general"],
         ["Nota", "", "Solo se usan las cuotas de los productos que tenga el incentivo. Una cuota 0 = ese producto no se le exige"],
+        ["Nota", "", "Si un vendedor está con su DNI y también entra por el equipo de su líder, vale su fila con DNI"],
     ], columns=["Columna", "¿Obligatoria?", "Qué poner"])
     return _excel({"Participantes": ejemplo, "Instrucciones": instrucciones}, texto_cols={"A", "E"})
 
@@ -226,9 +231,15 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
         df.loc[mover, "DNI"] = df.loc[mover, "DNI_LIDER"]
     df.loc[es_lider, "DNI_LIDER"] = ""
 
-    sin_dni = df["DNI"] == ""
+    # Vendedor sin DNI pero con DNI_LIDER = "todos los vendedores de ese líder"
+    df["EQUIPO"] = (df["ROL"] == "Vendedor") & (df["DNI"] == "") & (df["DNI_LIDER"] != "")
+    if df["EQUIPO"].any():
+        avisos.append(f"{int(df['EQUIPO'].sum())} fila(s) de vendedor sin DNI: participarán todos los "
+                      "vendedores de esos líderes según el Fanero.")
+
+    sin_dni = (df["DNI"] == "") & ~df["EQUIPO"]
     if sin_dni.any():
-        avisos.append(f"{int(sin_dni.sum())} fila(s) sin DNI se ignoraron.")
+        avisos.append(f"{int(sin_dni.sum())} fila(s) sin DNI ni DNI_LIDER se ignoraron.")
     malos = ~sin_dni & df["ROL"].isna()
     if malos.any():
         raise ValueError("ROL debe ser Vendedor o Líder. Revisa los DNI: "
@@ -244,12 +255,15 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
             raise ValueError(f"{c} tiene valores que no son números (DNI {', '.join(df.loc[raros, 'DNI'].head(5))}).")
         df[c] = num.map(lambda x: None if pd.isna(x) else int(x))
 
-    dup = df.duplicated(["DNI", "ROL"], keep="first")
+    clave = df["DNI"].where(~df["EQUIPO"], "EQUIPO:" + df["DNI_LIDER"])
+    dup = pd.DataFrame({"k": clave, "r": df["ROL"]}).duplicated(keep="first")
     if dup.any():
         avisos.append(f"{int(dup.sum())} DNI repetido(s) con el mismo rol; se tomó la primera fila: "
-                      + ", ".join(map(str, df.loc[dup, "DNI"].head(10))))
+                      + ", ".join(map(str, clave[dup].head(10))))
         df = df[~dup]
     registros = df.astype(object).where(df.notna(), None).to_dict("records")
+    for r in registros:
+        r["EQUIPO"] = bool(r.get("EQUIPO"))
     return registros, avisos
 
 
@@ -323,6 +337,10 @@ def _moda(serie: pd.Series) -> str:
     return m.iloc[0] if not m.empty else ""
 
 
+def _es_equipo(p: dict) -> bool:
+    return p.get("EQUIPO") in (True, 1, "True", "true")
+
+
 def _personas(universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
     """Tabla de participantes de un rol con DNI, NOMBRE, DEPARTAMENTO, LIDER y Q_<producto>."""
     col = "LOGIN" if rol == "Vendedor" else "LEADER"
@@ -333,7 +351,16 @@ def _personas(universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
 
     lista = [p for p in cfg.get("participantes") or [] if p.get("ROL") == rol]
     if cfg.get("participantes"):
-        base = pd.DataFrame(lista, columns=COLS_PARTICIPANTES)
+        directos = [p for p in lista if not _es_equipo(p)]
+        expandidos = []
+        for p in lista:
+            if not _es_equipo(p):
+                continue
+            logins = universo.loc[universo["LEADER"] == p["DNI_LIDER"], "LOGIN"]
+            for login in sorted(set(logins) - {""}):
+                expandidos.append({**p, "DNI": login, "NOMBRE": p.get("NOMBRE") or ""})
+        base = pd.DataFrame(directos + expandidos, columns=COLS_PARTICIPANTES)
+        base = base.drop_duplicates("DNI", keep="first")  # una fila explícita gana sobre el equipo
         base = base.merge(info, on="DNI", how="left")
         base["DEPARTAMENTO"] = base["DEPARTAMENTO"].where(base["DEPARTAMENTO"].fillna("") != "",
                                                           base["DEPTO_FANERO"]).fillna("")
