@@ -25,10 +25,10 @@ import pandas as pd
 
 COLUMNAS_REQUERIDAS = [
     "STATUS", "REQUESTSTARTHOUR", "LASTSTATUSMODDATE", "LASTSTATUSMODHOUR",
-    "LOGIN", "LEADER", "DEPARTMENT", "TIPO ACTIVACION", "PRODUCTO",
+    "LOGIN", "TARIFFPLANNAME", "LEADER", "DEPARTMENT", "TIPO ACTIVACION", "PRODUCTO",
 ]
 COLUMNAS_OPCIONALES = [
-    "ACTIVATIONTYPE", "TARIFFPLANNAME", "PARTNER", "USERTYPE", "LATITUDE",
+    "ACTIVATIONTYPE", "PARTNER", "USERTYPE", "LATITUDE",
     "LONGITUDE", "PORTABILIDAD", "CANAL", "PROVINCIA", "DISTRITO", "FUENTE UBICACION",
 ]
 
@@ -39,6 +39,35 @@ PRODUCTOS = {
     "PORTA PREPAGO": ("PRODUCTO", "PORTA PREPAGO"),
     "OSS": ("PRODUCTO", "OSS"),
 }
+
+
+# Planes (columna G, TARIFFPLANNAME) que normalmente tiene cada producto
+PLANES = {
+    "PREPAGO": ["Prepago 5", "Plan Flexible"],
+    "PORTA PREPAGO": ["Prepago 5", "Plan Flexible"],
+    "POSTPAGO": ["Power 29.90", "Power 39.90", "Power 49.90", "Power 59.90", "Power Ilim 69.90"],
+    "OSS": ["Power 29.90", "Power 39.90", "Power 49.90", "Power 59.90", "Power Ilim 69.90"],
+}
+
+
+def clave_plan(texto) -> str:
+    """Para comparar planes sin importar mayúsculas, tildes ni espacios dobles."""
+    return " ".join(sin_tildes(texto).split())
+
+
+def planes_disponibles(df: pd.DataFrame) -> dict:
+    """Catálogo + planes que aparecen en las ventas guardadas, por producto."""
+    out = {}
+    for p in PRODUCTOS:
+        vistos = {clave_plan(x) for x in PLANES[p]}
+        lista = list(PLANES[p])
+        if df is not None and not df.empty:
+            for x in sorted(df.loc[mascara_producto(df, p), "TARIFFPLANNAME"].dropna().unique()):
+                if x and clave_plan(x) not in vistos:
+                    vistos.add(clave_plan(x))
+                    lista.append(x)
+        out[p] = lista
+    return out
 
 
 def slug(producto: str) -> str:
@@ -237,6 +266,7 @@ CONFIG_DEFECTO = {
     "estados": ["Completada"],
     "departamentos": [],           # vacío = todos
     "productos": ["PREPAGO"],      # subconjunto de PRODUCTOS
+    "planes": {},                  # {producto: [planes]}; vacío = todos los planes
     "participa_vendedor": True,
     "participa_lider": True,
     "cuotas_vendedor": {"PREPAGO": 1},
@@ -255,12 +285,19 @@ def completar_config(cfg: dict) -> dict:
     cfg["productos"] = [p for p in cfg.get("productos") or [] if p in PRODUCTOS] or ["PREPAGO"]
     for clave in ("cuotas_vendedor", "cuotas_lider"):
         cfg[clave] = {p: int(cfg.get(clave, {}).get(p, 1) or 0) for p in cfg["productos"]}
+    planes = cfg.get("planes") or {}
+    cfg["planes"] = {p: list(planes.get(p) or []) for p in cfg["productos"] if planes.get(p)}
     return cfg
 
 
-def mascara_producto(df: pd.DataFrame, producto: str) -> pd.Series:
+def mascara_producto(df: pd.DataFrame, producto: str, planes=None) -> pd.Series:
+    """Filas que cuentan para el producto; si se dan planes, solo esos planes."""
     col, valor = PRODUCTOS[producto]
-    return df[col] == valor
+    m = df[col] == valor
+    if planes:
+        elegidos = {clave_plan(x) for x in planes}
+        m &= df["TARIFFPLANNAME"].map(clave_plan).isin(elegidos)
+    return m
 
 
 def filtrar(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -333,7 +370,7 @@ def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) ->
     d["DNI"] = d[col]
     d["DIA"] = d["LASTSTATUSMODDATE"]
     for p in prods:
-        dp = d[mascara_producto(d, p)].copy()
+        dp = d[mascara_producto(d, p, cfg["planes"].get(p))].copy()
         conteo = dp.groupby(claves).size().rename(f"V_{p}").reset_index()
         m = m.merge(conteo, on=claves, how="left")
         m[f"V_{p}"] = m[f"V_{p}"].fillna(0).astype(int)
@@ -421,11 +458,14 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
     for k, v in cfg.items():
         if k == "participantes":
             v = f"{len(v)} en lista" if v else "Todos los del Fanero"
+        elif k == "planes":
+            continue
         elif isinstance(v, dict):
             v = ", ".join(f"{p}: {n}" for p, n in v.items())
         elif isinstance(v, list):
             v = ", ".join(map(str, v))
         filas.append((k, v))
+    filas.append(("planes", "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()) or "Todos"))
     filas.append(("regla_productos", "PREPAGO/POSTPAGO por TIPO ACTIVACION; PORTA PREPAGO/OSS por PRODUCTO"))
     return pd.DataFrame(filas, columns=["Parámetro", "Valor"])
 

@@ -120,6 +120,17 @@ def valores_distintos(eng, columna: str) -> list[str]:
     return sorted(x for x in r if x)
 
 
+def planes_vistos(eng) -> pd.DataFrame:
+    """Combinaciones distintas de tipo de activación, producto y plan en la base."""
+    q = select(ventas.c.tipo_activacion, ventas.c.producto, ventas.c.tariffplanname).distinct()
+    with eng.connect() as cx:
+        df = pd.read_sql(q, cx)
+    df.columns = ["TIPO ACTIVACION", "PRODUCTO", "TARIFFPLANNAME"]
+    for c in ("TIPO ACTIVACION", "PRODUCTO"):
+        df[c] = df[c].map(core.sin_tildes)
+    return df
+
+
 def historial_cargas(eng) -> pd.DataFrame:
     with eng.connect() as cx:
         return pd.read_sql(select(cargas).order_by(cargas.c.id.desc()), cx)

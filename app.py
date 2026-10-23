@@ -157,6 +157,7 @@ with tab_inc:
 
         estados_bd = db.valores_distintos(eng, "status") or ["Completada"]
         deptos_bd = db.valores_distintos(eng, "department")
+        planes_disp = core.planes_disponibles(db.planes_vistos(eng))
 
         with st.form(clave_form):
             nombre = st.text_input("Nombre del incentivo", cfg0["nombre"],
@@ -186,22 +187,31 @@ with tab_inc:
 
             st.markdown("**Productos y cuotas generales** — debe cumplir la cuota de cada producto marcado")
             st.caption("Prepago y Postpago se cuentan con TIPO ACTIVACION (columna N). "
-                       "Porta prepago y OSS se cuentan con PRODUCTO (columna P).")
-            enc = st.columns([2, 1, 1])
+                       "Porta prepago y OSS se cuentan con PRODUCTO (columna P). "
+                       "Los planes salen de TARIFFPLANNAME (columna G).")
+            enc = st.columns([1.3, 1, 1, 3])
             enc[0].markdown("Producto")
             enc[1].markdown("Cuota vendedor")
             enc[2].markdown("Cuota líder (equipo)")
-            elegidos, cuotas_v, cuotas_l = [], {}, {}
+            enc[3].markdown("Planes que cuentan (vacío = todos)")
+            elegidos, cuotas_v, cuotas_l, planes_sel = [], {}, {}, {}
             for p in core.PRODUCTOS:
-                f = st.columns([2, 1, 1])
+                f = st.columns([1.3, 1, 1, 3])
                 marcado = f[0].checkbox(p.title(), p in cfg0["productos"], key=f"{clave_form}_{p}")
                 qv = f[1].number_input("Cuota vendedor", 0, 10000, int(cfg0["cuotas_vendedor"].get(p, 1)),
                                        key=f"{clave_form}_qv_{p}", label_visibility="collapsed")
                 ql = f[2].number_input("Cuota líder", 0, 100000, int(cfg0["cuotas_lider"].get(p, 1)),
                                        key=f"{clave_form}_ql_{p}", label_visibility="collapsed")
+                opciones_plan = planes_disp[p]
+                previos = [x for x in cfg0["planes"].get(p, []) if x in opciones_plan]
+                pl = f[3].multiselect("Planes", opciones_plan, default=previos,
+                                      key=f"{clave_form}_pl_{p}", label_visibility="collapsed",
+                                      placeholder="Todos los planes")
                 if marcado:
                     elegidos.append(p)
                     cuotas_v[p], cuotas_l[p] = int(qv), int(ql)
+                    if pl:
+                        planes_sel[p] = pl
 
             st.markdown("**Participantes**")
             c1, c2 = st.columns(2)
@@ -259,7 +269,7 @@ with tab_inc:
             else:
                 cfg = dict(nombre=nombre.strip(), fecha_inicio=str(fechas[0]), fecha_fin=str(fechas[1]),
                            hora_desde=h1, hora_hasta=h2, evaluacion=evaluacion, estados=estados,
-                           departamentos=deptos, productos=elegidos,
+                           departamentos=deptos, productos=elegidos, planes=planes_sel,
                            cuotas_vendedor=cuotas_v, cuotas_lider=cuotas_l,
                            participa_vendedor=p_vend, participa_lider=p_lid,
                            gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim),
@@ -285,6 +295,8 @@ def describir(cfg: dict) -> str:
     partes = [f"📅 {fechas}", f"🕒 {cfg['hora_desde']:02d}:00 a {cfg['hora_hasta']:02d}:59 (hora de solicitud)"]
     if cfg["evaluacion"] == "diaria":
         partes.append("cuota diaria")
+    if cfg["planes"]:
+        partes.append("📋 " + "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()))
     if cfg["participa_vendedor"]:
         partes.append("🎯 vendedor " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_vendedor"].items()))
     if cfg["participa_lider"]:
@@ -321,7 +333,7 @@ with tab_res:
             en_rango = core.filtrar(ventas_df, cfg)
             mask = pd.Series(False, index=en_rango.index)
             for p in cfg["productos"]:
-                mask |= core.mascara_producto(en_rango, p)
+                mask |= core.mascara_producto(en_rango, p, cfg["planes"].get(p))
             c4.metric("Ventas en el rango", f"{int(mask.sum()):,}",
                       help="Ventas de los productos del incentivo dentro de las fechas y horas")
 
