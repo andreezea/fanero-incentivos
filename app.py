@@ -152,13 +152,13 @@ with tab_inc:
         opciones = ["➕ Nuevo incentivo"] + [f"{i['id']} · {i['nombre']}" for i in existentes]
         elegido = st.selectbox("Crear o editar", opciones)
         actual = None if elegido.startswith("➕") else existentes[opciones.index(elegido) - 1]
-        cfg0 = {**core.CONFIG_DEFECTO, **(actual["config"] if actual else {})}
+        cfg0 = core.completar_config(actual["config"] if actual else {})
+        clave_form = f"form_inc_{actual['id'] if actual else 'nuevo'}"
 
         estados_bd = db.valores_distintos(eng, "status") or ["Completada"]
-        productos_bd = db.valores_distintos(eng, "producto")
         deptos_bd = db.valores_distintos(eng, "department")
 
-        with st.form("form_inc"):
+        with st.form(clave_form):
             nombre = st.text_input("Nombre del incentivo", cfg0["nombre"],
                                    placeholder="Ej. Madrugadores 23/10 · 7 a 10 am")
             c1, c2 = st.columns(2)
@@ -169,8 +169,7 @@ with tab_inc:
             evaluacion = c2.radio("¿Cómo se evalúa la cuota?",
                                   ["periodo", "diaria"], index=0 if cfg0["evaluacion"] == "periodo" else 1,
                                   format_func=lambda x: "Sumando todo el rango de fechas"
-                                  if x == "periodo" else "Cada día por separado (cuota diaria)",
-                                  horizontal=False)
+                                  if x == "periodo" else "Cada día por separado (cuota diaria)")
             c1, c2 = st.columns(2)
             horas = list(range(24))
             h1 = c1.selectbox("Hora desde (hora de solicitud)", horas, index=int(cfg0["hora_desde"]),
@@ -179,22 +178,45 @@ with tab_inc:
                               format_func=lambda h: f"{h:02d}:59")
 
             st.markdown("**Qué ventas cuentan**")
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             estados = c1.multiselect("Estado", estados_bd,
                                      default=[e for e in cfg0["estados"] if e in estados_bd])
-            productos = c2.multiselect("Producto (vacío = todos)", productos_bd,
-                                       default=[p for p in cfg0["productos"] if p in productos_bd])
-            deptos = c3.multiselect("Departamento (vacío = todos)", deptos_bd,
+            deptos = c2.multiselect("Departamento (vacío = todos)", deptos_bd,
                                     default=[d for d in cfg0["departamentos"] if d in deptos_bd])
 
-            st.markdown("**Participantes y cuotas**")
+            st.markdown("**Productos y cuotas generales** — debe cumplir la cuota de cada producto marcado")
+            st.caption("Prepago y Postpago se cuentan con TIPO ACTIVACION (columna N). "
+                       "Porta prepago y OSS se cuentan con PRODUCTO (columna P).")
+            enc = st.columns([2, 1, 1])
+            enc[0].markdown("Producto")
+            enc[1].markdown("Cuota vendedor")
+            enc[2].markdown("Cuota líder (equipo)")
+            elegidos, cuotas_v, cuotas_l = [], {}, {}
+            for p in core.PRODUCTOS:
+                f = st.columns([2, 1, 1])
+                marcado = f[0].checkbox(p.title(), p in cfg0["productos"], key=f"{clave_form}_{p}")
+                qv = f[1].number_input("Cuota vendedor", 0, 10000, int(cfg0["cuotas_vendedor"].get(p, 1)),
+                                       key=f"{clave_form}_qv_{p}", label_visibility="collapsed")
+                ql = f[2].number_input("Cuota líder", 0, 100000, int(cfg0["cuotas_lider"].get(p, 1)),
+                                       key=f"{clave_form}_ql_{p}", label_visibility="collapsed")
+                if marcado:
+                    elegidos.append(p)
+                    cuotas_v[p], cuotas_l[p] = int(qv), int(ql)
+
+            st.markdown("**Participantes**")
             c1, c2 = st.columns(2)
             p_vend = c1.checkbox("Participan vendedores (LOGIN)", cfg0["participa_vendedor"])
-            cuota_v = c1.number_input("Cuota vendedor (ventas)", 1, 10000, int(cfg0["cuota_vendedor"]))
             premio_v = c1.text_input("Premio vendedor", cfg0["premio_vendedor"])
             p_lid = c2.checkbox("Participan líderes (LEADER, suma de su equipo)", cfg0["participa_lider"])
-            cuota_l = c2.number_input("Cuota líder (ventas del equipo)", 1, 100000, int(cfg0["cuota_lider"]))
             premio_l = c2.text_input("Premio líder", cfg0["premio_lider"])
+
+            n_lista = len(cfg0["participantes"])
+            st.caption(f"Lista actual: {n_lista} participantes. Solo ellos compiten."
+                       if n_lista else
+                       "Sin lista: compiten todos los que aparecen en el Fanero con la cuota general.")
+            archivo_part = st.file_uploader("Lista de participantes (opcional; reemplaza la actual)",
+                                            type=["xlsx", "xls", "csv"])
+            quitar_lista = st.checkbox("Quitar la lista y que compitan todos", False) if n_lista else False
 
             st.markdown("**Quiénes ganan** (puedes marcar ambas)")
             c1, c2 = st.columns(2)
@@ -205,14 +227,28 @@ with tab_inc:
 
             guardar = st.form_submit_button("Guardar incentivo", type="primary")
 
+        st.download_button("⬇️ Descargar plantilla de participantes", core.plantilla_participantes(),
+                           file_name="plantilla_participantes.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
         if guardar:
-            errores = []
+            errores, avisos = [], []
+            participantes = [] if quitar_lista else cfg0["participantes"]
+            if archivo_part is not None:
+                try:
+                    participantes, avisos = core.leer_participantes(archivo_part.name, archivo_part.getvalue())
+                    if not participantes:
+                        errores.append("La lista de participantes no tiene filas válidas.")
+                except Exception as e:
+                    errores.append(f"Lista de participantes: {e}")
             if not nombre.strip():
                 errores.append("Ponle un nombre.")
             if len(fechas) != 2:
                 errores.append("Elige fecha de inicio y fin (para un solo día, elige el mismo día dos veces).")
             if h1 > h2:
                 errores.append("La hora desde no puede ser mayor que la hora hasta.")
+            if not elegidos:
+                errores.append("Marca al menos un producto.")
             if not (p_vend or p_lid):
                 errores.append("Marca al menos un tipo de participante.")
             if not (g_todos or g_prim):
@@ -223,14 +259,17 @@ with tab_inc:
             else:
                 cfg = dict(nombre=nombre.strip(), fecha_inicio=str(fechas[0]), fecha_fin=str(fechas[1]),
                            hora_desde=h1, hora_hasta=h2, evaluacion=evaluacion, estados=estados,
-                           productos=productos, departamentos=deptos,
+                           departamentos=deptos, productos=elegidos,
+                           cuotas_vendedor=cuotas_v, cuotas_lider=cuotas_l,
                            participa_vendedor=p_vend, participa_lider=p_lid,
-                           cuota_vendedor=int(cuota_v), cuota_lider=int(cuota_l),
                            gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim),
-                           premio_vendedor=premio_v, premio_lider=premio_l)
+                           premio_vendedor=premio_v, premio_lider=premio_l,
+                           participantes=participantes)
                 db.guardar_incentivo(eng, cfg, actual["id"] if actual else None)
-                st.success("Incentivo guardado. Míralo en la pestaña Resultados.")
-                st.rerun()
+                for a in avisos:
+                    st.warning(a)
+                st.success(f"Incentivo guardado con {len(participantes) or 'todos los'} participantes. "
+                           "Míralo en la pestaña Resultados.")
 
         if actual and st.button("Archivar este incentivo"):
             db.archivar_incentivo(eng, actual["id"])
@@ -246,20 +285,17 @@ def describir(cfg: dict) -> str:
     partes = [f"📅 {fechas}", f"🕒 {cfg['hora_desde']:02d}:00 a {cfg['hora_hasta']:02d}:59 (hora de solicitud)"]
     if cfg["evaluacion"] == "diaria":
         partes.append("cuota diaria")
-    cuotas = []
     if cfg["participa_vendedor"]:
-        cuotas.append(f"vendedor {cfg['cuota_vendedor']}")
+        partes.append("🎯 vendedor " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_vendedor"].items()))
     if cfg["participa_lider"]:
-        cuotas.append(f"líder {cfg['cuota_lider']}")
-    partes.append("🎯 cuota " + " · ".join(cuotas))
+        partes.append("🎯 líder " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_lider"].items()))
     gana = []
     if cfg["gana_todos_cumplen"]:
         gana.append("todos los que cumplen")
     if cfg["gana_primeros_depto"]:
         gana.append(f"primeros {cfg['primeros_n']} por depto")
     partes.append("🏆 " + " + ".join(gana))
-    if cfg["productos"]:
-        partes.append("📦 " + ", ".join(cfg["productos"]))
+    partes.append(f"👥 {len(cfg['participantes'])} en lista" if cfg["participantes"] else "👥 todos los del Fanero")
     return "  |  ".join(partes)
 
 
@@ -269,7 +305,7 @@ with tab_res:
         st.info("Aún no hay incentivos. Créalos en la pestaña ⚙️ Incentivos.")
     else:
         sel = st.selectbox("Incentivo", incs, format_func=lambda i: f"{i['id']} · {i['nombre']}")
-        cfg = {**core.CONFIG_DEFECTO, **sel["config"]}
+        cfg = core.completar_config(sel["config"])
         st.caption(describir(cfg))
 
         ventas_df = ventas_cacheadas(cfg["fecha_inicio"], cfg["fecha_fin"], st.session_state.version_datos)
@@ -282,13 +318,18 @@ with tab_res:
             c1.metric("Participantes", f"{len(matriz):,}")
             c2.metric("Cumplen cuota", f"{(matriz['CUMPLE'] == 'Sí').sum():,}")
             c3.metric("Ganadores", f"{len(ganadores):,}")
-            c4.metric("Ventas en el rango", f"{len(core.filtrar(ventas_df, cfg)):,}")
+            en_rango = core.filtrar(ventas_df, cfg)
+            mask = pd.Series(False, index=en_rango.index)
+            for p in cfg["productos"]:
+                mask |= core.mascara_producto(en_rango, p)
+            c4.metric("Ventas en el rango", f"{int(mask.sum()):,}",
+                      help="Ventas de los productos del incentivo dentro de las fechas y horas")
 
             c1, c2, c3, c4 = st.columns(4)
             f_rol = c1.multiselect("Rol", sorted(matriz["ROL"].unique()))
             f_dep = c2.multiselect("Departamento", sorted(matriz["DEPARTAMENTO"].unique()))
             f_gana = c3.selectbox("Mostrar", ["Todos", "Solo ganadores", "Solo no ganadores"])
-            f_dni = c4.text_input("Buscar DNI")
+            f_dni = c4.text_input("Buscar DNI o nombre")
             vista = matriz
             if f_rol:
                 vista = vista[vista["ROL"].isin(f_rol)]
@@ -299,7 +340,9 @@ with tab_res:
             elif f_gana == "Solo no ganadores":
                 vista = vista[vista["GANA"] == "No"]
             if f_dni:
-                vista = vista[vista["DNI"].str.contains(f_dni.strip()) | vista["LIDER"].str.contains(f_dni.strip())]
+                b = f_dni.strip()
+                vista = vista[vista["DNI"].str.contains(b, regex=False) | vista["LIDER"].str.contains(b, regex=False)
+                              | vista["NOMBRE"].fillna("").str.contains(b, case=False, regex=False)]
 
             def pintar(fila):
                 color = "background-color: #DCEFF8" if fila["GANA"] == "Sí" else ""
@@ -309,7 +352,7 @@ with tab_res:
                 vista.style.apply(pintar, axis=1),
                 width="stretch", hide_index=True, height=520,
                 column_config={
-                    "AVANCE_%": st.column_config.ProgressColumn("Avance", format="%.0f%%",
+                    "AVANCE_%": st.column_config.ProgressColumn("Avance (producto más atrasado)", format="%.0f%%",
                                                                 min_value=0, max_value=100),
                     "HORA_CUOTA": st.column_config.DatetimeColumn("Llegó a la cuota",
                                                                   format="DD/MM/YYYY HH:mm:ss"),
