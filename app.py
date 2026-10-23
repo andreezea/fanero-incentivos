@@ -234,6 +234,9 @@ with tab_inc:
             g_prim = c2.checkbox("Los primeros en llegar a la cuota en cada departamento",
                                  cfg0["gana_primeros_depto"])
             n_prim = c2.number_input("¿Cuántos primeros por departamento?", 1, 50, int(cfg0["primeros_n"]))
+            cupos = st.number_input("Cupos: máximo de ganadores por rol, los primeros en llegar a la cuota "
+                                    "(0 = sin límite; si es cuota diaria, cupos por día)",
+                                    0, 10000, int(cfg0.get("cupos") or 0))
 
             guardar = st.form_submit_button("Guardar incentivo", type="primary")
 
@@ -272,7 +275,7 @@ with tab_inc:
                            departamentos=deptos, productos=elegidos, planes=planes_sel,
                            cuotas_vendedor=cuotas_v, cuotas_lider=cuotas_l,
                            participa_vendedor=p_vend, participa_lider=p_lid,
-                           gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim),
+                           gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim), cupos=int(cupos),
                            premio_vendedor=premio_v, premio_lider=premio_l,
                            participantes=participantes)
                 db.guardar_incentivo(eng, cfg, actual["id"] if actual else None)
@@ -306,6 +309,8 @@ def describir(cfg: dict) -> str:
         gana.append("todos los que cumplen")
     if cfg["gana_primeros_depto"]:
         gana.append(f"primeros {cfg['primeros_n']} por depto")
+    if cfg.get("cupos"):
+        gana.append(f"máximo {cfg['cupos']} cupos")
     partes.append("🏆 " + " + ".join(gana))
     partes.append(f"👥 {len(cfg['participantes'])} en lista" if cfg["participantes"] else "👥 todos los del Fanero")
     return "  |  ".join(partes)
@@ -369,6 +374,7 @@ with tab_res:
                     "HORA_CUOTA": st.column_config.DatetimeColumn("Llegó a la cuota",
                                                                   format="DD/MM/YYYY HH:mm:ss"),
                     "PUESTO_DEPTO": st.column_config.NumberColumn("Puesto depto"),
+                    "PUESTO_GENERAL": st.column_config.NumberColumn("Puesto general"),
                     "LIDER": "Líder",
                     "DIA": st.column_config.DateColumn("Día", format="DD/MM/YYYY"),
                 })

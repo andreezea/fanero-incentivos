@@ -92,7 +92,10 @@ def _txt(serie: pd.Series) -> pd.Series:
 
 
 def _limpiar_id(serie: pd.Series) -> pd.Series:
-    return _txt(serie).str.replace(r"\.0$", "", regex=True).str.lstrip("'").str.strip()
+    """DNI/LOGIN como texto, sin decimales de Excel, sin apóstrofo y sin ceros a la izquierda
+    (el Fanero trae 5353035 donde una lista puede traer 05353035)."""
+    s = _txt(serie).str.replace(r"\.0$", "", regex=True).str.lstrip("'").str.strip()
+    return s.str.lstrip("0")
 
 
 def _decodificar(contenido: bytes) -> str:
@@ -168,6 +171,8 @@ def desde_bd(df: pd.DataFrame) -> pd.DataFrame:
     out["REQUESTSTARTHOUR"] = pd.to_numeric(out["REQUESTSTARTHOUR"], errors="coerce").astype("Int64")
     for c in ("TIPO ACTIVACION", "PRODUCTO", "DEPARTMENT"):
         out[c] = out[c].map(sin_tildes)
+    out["LOGIN"] = _limpiar_id(out["LOGIN"])
+    out["LEADER"] = _limpiar_id(out["LEADER"])
     return out
 
 
@@ -288,6 +293,7 @@ CONFIG_DEFECTO = {
     "gana_todos_cumplen": True,
     "gana_primeros_depto": False,
     "primeros_n": 1,
+    "cupos": 0,                    # 0 = sin límite; si no, solo los primeros N ganadores en llegar
     "premio_vendedor": "",
     "premio_lider": "",
     "participantes": [],           # lista por incentivo; vacía = todos los del Fanero
@@ -423,11 +429,24 @@ def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) ->
     grupo = ["DEPARTAMENTO"] + (["DIA"] if diaria else [])
     m["PUESTO_DEPTO"] = (m[m["CUMPLE"]].groupby(grupo)["HORA_CUOTA"]
                          .rank(method="first").reindex(m.index))
+    grupo_general = ["DIA"] if diaria else None
+    llegada = m[m["CUMPLE"]]
+    m["PUESTO_GENERAL"] = ((llegada.groupby(grupo_general)["HORA_CUOTA"] if grupo_general
+                            else llegada["HORA_CUOTA"]).rank(method="first").reindex(m.index))
     gana_todos = m["CUMPLE"] & bool(cfg.get("gana_todos_cumplen"))
     gana_primero = m["PUESTO_DEPTO"].le(int(cfg.get("primeros_n", 1))) & bool(cfg.get("gana_primeros_depto"))
     m["GANA"] = gana_todos | gana_primero
     m["MOTIVO"] = [" + ".join(r for r, ok in (("Cumplió cuota", t), ("Primero(s) del departamento", p)) if ok)
                    for t, p in zip(gana_todos, gana_primero)]
+    cupos = int(cfg.get("cupos") or 0)
+    if cupos > 0:
+        # entre los que ganarían, solo los primeros `cupos` en llegar a la cuota (por día si es diaria)
+        cand = m[m["GANA"]]
+        orden_cupo = ((cand.groupby(grupo_general)["HORA_CUOTA"] if grupo_general else cand["HORA_CUOTA"])
+                      .rank(method="first").reindex(m.index))
+        sin_cupo = m["GANA"] & orden_cupo.gt(cupos)
+        m.loc[sin_cupo, "GANA"] = False
+        m.loc[sin_cupo, "MOTIVO"] = "Cumplió, pero sin cupo"
     premio = cfg.get("premio_vendedor" if rol == "Vendedor" else "premio_lider", "")
     m["PREMIO"] = m["GANA"].map(lambda g: premio if g else "")
     m.insert(0, "ROL", rol)
@@ -456,14 +475,16 @@ def calcular(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         renombre[f"V_{p}"] = f"{p} VENTAS"
         renombre[f"Q_{p}"] = f"{p} CUOTA"
         cols += [f"V_{p}", f"Q_{p}"]
-    cols += ["TOTAL_VENTAS", "AVANCE_%", "FALTAN", "CUMPLE", "HORA_CUOTA", "PUESTO_DEPTO",
+    cols += ["TOTAL_VENTAS", "AVANCE_%", "FALTAN", "CUMPLE", "HORA_CUOTA", "PUESTO_GENERAL", "PUESTO_DEPTO",
              "GANA", "MOTIVO", "PREMIO"]
     m = m[cols].rename(columns=renombre)
     m["PUESTO_DEPTO"] = m["PUESTO_DEPTO"].astype("Int64")
+    m["PUESTO_GENERAL"] = m["PUESTO_GENERAL"].astype("Int64")
     m["CUMPLE"] = m["CUMPLE"].map({True: "Sí", False: "No"})
     m["GANA"] = m["GANA"].map({True: "Sí", False: "No"})
     orden = ["ROL", "DEPARTAMENTO"] + (["DIA"] if diaria else [])
-    m = m.sort_values(orden + ["GANA", "PUESTO_DEPTO", "AVANCE_%"],
+    orden = ["ROL"] + (["DIA"] if diaria else [])
+    m = m.sort_values(orden + ["GANA", "PUESTO_GENERAL", "AVANCE_%"],
                       ascending=[True] * len(orden) + [False, True, False], na_position="last")
     return m.reset_index(drop=True)
 
