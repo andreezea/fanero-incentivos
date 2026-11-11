@@ -329,11 +329,17 @@ with tab_inc:
                     rec_l[p] = int(rl_)
 
             st.markdown("**Participantes**")
+            tipos = ["Solo vendedores", "Solo líderes", "Vendedores y líderes"]
+            actual_tipo = ("Vendedores y líderes" if cfg0["participa_vendedor"] and cfg0["participa_lider"]
+                           else "Solo líderes" if cfg0["participa_lider"] else "Solo vendedores")
+            tipo = st.radio("¿Para quién es el incentivo?", tipos, index=tipos.index(actual_tipo), horizontal=True,
+                            help="Solo vendedores: la matriz muestra únicamente filas de Vendedor (LOGIN), "
+                                 "aunque el DNI también sea líder. Solo líderes: suma de su equipo (LEADER).")
+            p_vend = tipo != "Solo líderes"
+            p_lid = tipo != "Solo vendedores"
             c1, c2 = st.columns(2)
-            p_vend = c1.checkbox("Participan vendedores (LOGIN)", cfg0["participa_vendedor"])
             premio_v = c1.text_input("Premio vendedor", cfg0["premio_vendedor"])
-            p_lid = c2.checkbox("Participan líderes (LEADER, suma de su equipo)", cfg0["participa_lider"])
-            premio_l = c2.text_input("Premio líder", cfg0["premio_lider"])
+            premio_l = c2.text_input("Premio líder (solo si participan líderes)", cfg0["premio_lider"])
 
             n_lista = len(cfg0["participantes"])
             st.caption(f"Lista actual: {n_lista} participantes. Solo ellos compiten."
@@ -452,6 +458,10 @@ with tab_res:
         cfg = core.completar_config(sel["config"])
         cfg_json = json.dumps(cfg, sort_keys=True, default=str, ensure_ascii=False)
         st.caption(describir(cfg))
+        if cfg["participa_lider"]:
+            st.info("Este incentivo incluye **líderes** (" + ("vendedores y líderes" if cfg["participa_vendedor"]
+                    else "solo líderes") + "). Si es solo para vendedores, edítalo en ⚙️ Incentivos y elige "
+                    "**Solo vendedores**: así no aparecerán filas de Líder.")
 
         version = version_datos()
         if core.usa_recargas(cfg):
