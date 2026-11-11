@@ -70,6 +70,12 @@ def planes_disponibles(df: pd.DataFrame) -> dict:
     return out
 
 
+# Productos que pueden exigir recargas (Consolidado, columna T "UR's")
+#   PREPAGO       -> UR's (= UR VR PP + UR PORTA PP), igual que la regla de la columna N
+#   PORTA PREPAGO -> Suma de UR PORTA PP
+RECARGABLES = {"PREPAGO": "UR_PREPAGO", "PORTA PREPAGO": "UR_PORTA"}
+
+
 def slug(producto: str) -> str:
     return producto.replace(" ", "_")
 
@@ -177,18 +183,87 @@ def desde_bd(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Consolidado (recargas)
+# --------------------------------------------------------------------------- #
+def _col(df: pd.DataFrame, *nombres):
+    norm = {sin_tildes(c).replace("'", "").replace(" ", ""): c for c in df.columns}
+    for n in nombres:
+        k = sin_tildes(n).replace("'", "").replace(" ", "")
+        if k in norm:
+            return norm[k]
+    return None
+
+
+def detectar_mes(texto: str):
+    """Mes y año del filtro del Consolidado ('REQUESTDATE el o después del 01/11/2026')."""
+    import re
+    t = str(texto or "")
+    m = re.search(r"REQUESTDATE[^0-9]*(\d{1,2})/(\d{1,2})/(\d{4})", t, re.I) or \
+        re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
+    return (int(m.group(2)), int(m.group(3))) if m else (None, None)
+
+
+def leer_consolidado(nombre: str, contenido: bytes) -> tuple[pd.DataFrame, tuple, str]:
+    """Devuelve (tabla cruda con encabezados, (mes, año) detectado, texto de filtros)."""
+    if nombre.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        crudo = pd.read_excel(io.BytesIO(contenido), header=None, dtype=str)
+    else:
+        crudo = leer_tabla(nombre, contenido).T.reset_index().T.reset_index(drop=True)
+    fila = None
+    for i in range(min(30, len(crudo))):
+        valores = {sin_tildes(x) for x in crudo.iloc[i].tolist() if isinstance(x, str)}
+        if "LOGIN" in valores and "DIA" in valores:
+            fila = i
+            break
+    if fila is None:
+        raise ValueError("No encontré la fila de encabezados (LOGIN, Dia, ...) en el Consolidado.")
+    filtros = " ".join(str(x) for x in crudo.iloc[:fila].fillna("").to_numpy().ravel() if str(x).strip())
+    df = crudo.iloc[fila + 1:].copy()
+    df.columns = [str(c).strip() for c in crudo.iloc[fila]]
+    return df.dropna(how="all").reset_index(drop=True), detectar_mes(filtros), filtros
+
+
+def normalizar_consolidado(df: pd.DataFrame, mes: int, anio: int) -> pd.DataFrame:
+    c_login, c_lider, c_dia = _col(df, "LOGIN"), _col(df, "LIDER", "LEADER"), _col(df, "Dia")
+    c_plan, c_dep = _col(df, "TARIFFPLANNAME"), _col(df, "DEPARTAMENTO", "DEPARTMENT")
+    c_ur = _col(df, "UR's", "URs", "UR")
+    c_ur_porta = _col(df, "Suma de UR PORTA PP")
+    faltan = [n for n, c in (("LOGIN", c_login), ("LIDER", c_lider), ("Dia", c_dia),
+                             ("TARIFFPLANNAME", c_plan), ("UR's (columna T)", c_ur)) if c is None]
+    if faltan:
+        raise ValueError("Al Consolidado le faltan estas columnas: " + ", ".join(faltan))
+    num = lambda c: pd.to_numeric(_txt(df[c]).str.replace(",", "", regex=False), errors="coerce").fillna(0) \
+        if c else pd.Series(0, index=df.index)
+    dia = pd.to_numeric(_txt(df[c_dia]), errors="coerce")
+    out = pd.DataFrame({
+        "LOGIN": _limpiar_id(df[c_login]),
+        "LEADER": _limpiar_id(df[c_lider]),
+        "FECHA": pd.to_datetime(dict(year=anio, month=mes, day=dia), errors="coerce").dt.date,
+        "TARIFFPLANNAME": _txt(df[c_plan]),
+        "DEPARTMENT": df[c_dep].map(sin_tildes) if c_dep else "",
+        "UR_PREPAGO": num(c_ur).astype(int),
+        "UR_PORTA": num(c_ur_porta).astype(int),
+    })
+    out = out[(out["LOGIN"] != "") & out["FECHA"].notna()]
+    # una fila por login, día y plan
+    return (out.groupby(["LOGIN", "LEADER", "FECHA", "TARIFFPLANNAME", "DEPARTMENT"], as_index=False)
+            [["UR_PREPAGO", "UR_PORTA"]].sum())
+
+
+# --------------------------------------------------------------------------- #
 # Participantes
 # --------------------------------------------------------------------------- #
 COLS_PARTICIPANTES = (["DNI", "NOMBRE", "ROL", "DEPARTAMENTO", "DNI_LIDER"]
-                      + [f"CUOTA_{slug(p)}" for p in PRODUCTOS])
+                      + [f"CUOTA_{slug(p)}" for p in PRODUCTOS]
+                      + [f"RECARGA_{slug(p)}" for p in RECARGABLES])
 
 
 def plantilla_participantes() -> bytes:
     ejemplo = pd.DataFrame([
-        ["40854375", "Juan Pérez", "Vendedor", "LORETO", "41544805", 5, "", 2, ""],
-        ["62300640", "María Ríos", "Vendedor", "LORETO", "41544805", "", "", "", ""],
-        ["", "", "Vendedor", "", "40687294", 5, "", "", ""],
-        ["41544805", "Carlos Soto", "Líder", "LORETO", "", 30, "", 10, ""],
+        ["40854375", "Juan Pérez", "Vendedor", "LORETO", "41544805", 5, "", 2, "", "", ""],
+        ["62300640", "María Ríos", "Vendedor", "LORETO", "41544805", "", "", "", "", "", ""],
+        ["", "", "Vendedor", "", "40687294", 15, "", "", "", 3, ""],
+        ["41544805", "Carlos Soto", "Líder", "LORETO", "", 30, "", 10, "", "", ""],
     ], columns=COLS_PARTICIPANTES)
     instrucciones = pd.DataFrame([
         ["DNI", "Obligatorio*", "El número que sale en LOGIN (vendedor) o LEADER (líder) del Fanero. "
@@ -203,6 +278,10 @@ def plantilla_participantes() -> bytes:
         ["CUOTA_POSTPAGO", "Opcional", "Cuota individual de postpago (TIPO ACTIVACION = POSTPAGO). Vacío = cuota general"],
         ["CUOTA_PORTA_PREPAGO", "Opcional", "Cuota individual de porta prepago (PRODUCTO = PORTA PREPAGO). Vacío = cuota general"],
         ["CUOTA_OSS", "Opcional", "Cuota individual de OSS (PRODUCTO = OSS). Vacío = cuota general"],
+        ["RECARGA_PREPAGO", "Opcional", "Mínimo de prepagos recargados (Consolidado, columna T). "
+                                        "Vacío = el mínimo general del incentivo"],
+        ["RECARGA_PORTA_PREPAGO", "Opcional", "Mínimo de porta prepago recargadas (Consolidado, UR PORTA PP). "
+                                              "Vacío = el mínimo general"],
         ["Nota", "", "Solo se usan las cuotas de los productos que tenga el incentivo. Una cuota 0 = ese producto no se le exige"],
         ["Nota", "", "Si un vendedor está con su DNI y también entra por el equipo de su líder, vale su fila con DNI"],
     ], columns=["Columna", "¿Obligatoria?", "Qué poner"])
@@ -251,8 +330,7 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
                          + ", ".join(map(str, df.loc[malos, "DNI"].head(10))))
     df = df[~sin_dni]
 
-    for p in PRODUCTOS:
-        c = f"CUOTA_{slug(p)}"
+    for c in [f"CUOTA_{slug(p)}" for p in PRODUCTOS] + [f"RECARGA_{slug(p)}" for p in RECARGABLES]:
         txt = _txt(df[c]).str.replace(r"\.0$", "", regex=True)
         num = pd.to_numeric(txt, errors="coerce")
         raros = (txt != "") & num.isna()
@@ -287,9 +365,11 @@ CONFIG_DEFECTO = {
     "productos": ["PREPAGO"],      # subconjunto de PRODUCTOS
     "planes": {},                  # {producto: [planes]}; vacío = todos los planes
     "participa_vendedor": True,
-    "participa_lider": True,
+    "participa_lider": False,      # se marca a propósito; evita premiar líderes por error
     "cuotas_vendedor": {"PREPAGO": 1},
     "cuotas_lider": {"PREPAGO": 1},
+    "recargas_vendedor": {},       # {producto: mínimo recargadas}; solo PREPAGO / PORTA PREPAGO
+    "recargas_lider": {},
     "gana_todos_cumplen": True,
     "gana_primeros_depto": False,
     "primeros_n": 1,
@@ -305,6 +385,9 @@ def completar_config(cfg: dict) -> dict:
     cfg["productos"] = [p for p in cfg.get("productos") or [] if p in PRODUCTOS] or ["PREPAGO"]
     for clave in ("cuotas_vendedor", "cuotas_lider"):
         cfg[clave] = {p: int(cfg.get(clave, {}).get(p, 1) or 0) for p in cfg["productos"]}
+    for clave in ("recargas_vendedor", "recargas_lider"):
+        r = cfg.get(clave) or {}
+        cfg[clave] = {p: int(r.get(p) or 0) for p in cfg["productos"] if p in RECARGABLES and int(r.get(p) or 0) > 0}
     planes = cfg.get("planes") or {}
     cfg["planes"] = {p: list(planes.get(p) or []) for p in cfg["productos"] if planes.get(p)}
     return cfg
@@ -337,6 +420,20 @@ def filtrar(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return d
 
 
+def _moda_por(df: pd.DataFrame, clave: str, valor: str) -> pd.Series:
+    """Valor más frecuente de `valor` para cada `clave` (vectorizado, sin apply)."""
+    if clave == valor:
+        u = pd.Series(df[clave].unique())
+        return pd.Series(u.values, index=pd.Index(u.values, name=clave), name=valor)
+    d = df[[clave, valor]]
+    d = d[d[valor].astype(object).where(d[valor].notna(), "") != ""]
+    if d.empty:
+        return pd.Series(dtype=object, name=valor).rename_axis(clave)
+    c = d.groupby([clave, valor], sort=False).size().rename("n").reset_index()
+    c = c.sort_values([clave, "n", valor], ascending=[True, False, True])
+    return c.drop_duplicates(clave).set_index(clave)[valor]
+
+
 def _moda(serie: pd.Series) -> str:
     s = serie[_txt(serie) != ""]
     m = s.mode()
@@ -351,9 +448,12 @@ def _personas(universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
     """Tabla de participantes de un rol con DNI, NOMBRE, DEPARTAMENTO, LIDER y Q_<producto>."""
     col = "LOGIN" if rol == "Vendedor" else "LEADER"
     general = cfg["cuotas_vendedor"] if rol == "Vendedor" else cfg["cuotas_lider"]
-    info = (universo[universo[col] != ""].groupby(col)
-            .agg(DEPTO_FANERO=("DEPARTMENT", _moda), LIDER_FANERO=("LEADER", _moda))
+    rec_general = cfg["recargas_vendedor"] if rol == "Vendedor" else cfg["recargas_lider"]
+    u = universo[universo[col] != ""]
+    info = (_moda_por(u, col, "DEPARTMENT").rename("DEPTO_FANERO").to_frame()
+            .join(_moda_por(u, col, "LEADER").rename("LIDER_FANERO"), how="left")
             .reset_index().rename(columns={col: "DNI"}))
+    info["LIDER_FANERO"] = info["LIDER_FANERO"].fillna("")
 
     lista = [p for p in cfg.get("participantes") or [] if p.get("ROL") == rol]
     if cfg.get("participantes"):
@@ -375,14 +475,20 @@ def _personas(universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
         for p in cfg["productos"]:
             ind = pd.to_numeric(base[f"CUOTA_{slug(p)}"], errors="coerce")
             base[f"Q_{p}"] = ind.fillna(general[p]).astype(int)
+        for p in rec_general:
+            ind = pd.to_numeric(base[f"RECARGA_{slug(p)}"], errors="coerce")
+            base[f"RQ_{p}"] = ind.fillna(rec_general[p]).astype(int)
     else:
         base = info.rename(columns={"DEPTO_FANERO": "DEPARTAMENTO", "LIDER_FANERO": "LIDER"})
         base["NOMBRE"] = ""
         for p in cfg["productos"]:
             base[f"Q_{p}"] = int(general[p])
+        for p in rec_general:
+            base[f"RQ_{p}"] = int(rec_general[p])
     if rol == "Líder":
         base["LIDER"] = ""
-    return base[["DNI", "NOMBRE", "DEPARTAMENTO", "LIDER"] + [f"Q_{p}" for p in cfg["productos"]]]
+    return base[["DNI", "NOMBRE", "DEPARTAMENTO", "LIDER"] + [f"Q_{p}" for p in cfg["productos"]]
+                + [f"RQ_{p}" for p in rec_general]]
 
 
 def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
@@ -414,30 +520,76 @@ def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) ->
                  .rename(columns={"FECHA_HORA": f"T_{p}"}))
         m = m.merge(llega, on=claves, how="left")
 
+    # Recargadas (Consolidado, columna T). No tiene hora: cuenta todo el día.
+    rec_general = cfg["recargas_vendedor"] if rol == "Vendedor" else cfg["recargas_lider"]
+    rec = cfg.get("_recargas")
+    for p in rec_general:
+        if rec is not None and not rec.empty:
+            r = rec[rec[col] != ""].copy()
+            if cfg.get("fecha_inicio"):
+                r = r[r["FECHA"] >= pd.to_datetime(cfg["fecha_inicio"]).date()]
+            if cfg.get("fecha_fin"):
+                r = r[r["FECHA"] <= pd.to_datetime(cfg["fecha_fin"]).date()]
+            if cfg.get("departamentos"):
+                r = r[r["DEPARTMENT"].isin(cfg["departamentos"])]
+            planes = cfg["planes"].get(p)
+            if planes:
+                r = r[r["TARIFFPLANNAME"].map(clave_plan).isin({clave_plan(x) for x in planes})]
+            r["DNI"], r["DIA"] = r[col], r["FECHA"]
+            conteo = r.groupby(claves)[RECARGABLES[p]].sum().rename(f"R_{p}").reset_index()
+            m = m.merge(conteo, on=claves, how="left")
+        else:
+            m[f"R_{p}"] = 0
+        m[f"R_{p}"] = m[f"R_{p}"].fillna(0).astype(int)
+
     q = m[[f"Q_{p}" for p in prods]].to_numpy()
     v = m[[f"V_{p}" for p in prods]].to_numpy()
     m["TOTAL_VENTAS"] = v.sum(axis=1)
     cumple_p = v >= q
     m["CUMPLE"] = cumple_p.all(axis=1)
-    pct = pd.DataFrame(
-        {p: (m[f"V_{p}"] / m[f"Q_{p}"].where(m[f"Q_{p}"] > 0) * 100) for p in prods})
-    m["AVANCE_%"] = pct.clip(upper=100).min(axis=1, skipna=True).fillna(100).round(1)
-    m["FALTAN"] = (q - v).clip(min=0).sum(axis=1)
+    pct = {p: (m[f"V_{p}"] / m[f"Q_{p}"].where(m[f"Q_{p}"] > 0) * 100) for p in prods}
+    faltan = (q - v).clip(min=0).sum(axis=1)
+    for p in rec_general:
+        m["CUMPLE"] &= m[f"R_{p}"] >= m[f"RQ_{p}"]
+        pct[f"R_{p}"] = m[f"R_{p}"] / m[f"RQ_{p}"].where(m[f"RQ_{p}"] > 0) * 100
+        faltan = faltan + (m[f"RQ_{p}"] - m[f"R_{p}"]).clip(lower=0).to_numpy()
+    m["AVANCE_%"] = pd.DataFrame(pct).clip(upper=100).min(axis=1, skipna=True).fillna(100).round(1)
+    m["FALTAN"] = faltan
     tiempos = m[[f"T_{p}" for p in prods]].where(m[[f"Q_{p}" for p in prods]].gt(0).to_numpy())
     m["HORA_CUOTA"] = tiempos.max(axis=1).where(m["CUMPLE"])
 
+    # --- Un solo premio por persona -------------------------------------------
+    # PDV sin vendedores (todas las ventas donde figura como LEADER las hizo él mismo,
+    # LOGIN = LEADER): si participan vendedores, aparece solo como vendedor y no se repite.
+    # Líder que ya gana como vendedor en el mismo periodo/día: tampoco gana como líder.
+    m["_EXCL"] = ""
+    if rol == "Líder":
+        u = universo[(universo["LEADER"] != "") & (universo["LOGIN"] != universo["LEADER"])]
+        con_equipo = set(u["LEADER"])
+        if cfg.get("participa_vendedor"):
+            # PDV sin vendedores: ya está en la matriz como vendedor con su DNI -> no se repite como líder
+            m = m[m["DNI"].isin(con_equipo)].reset_index(drop=True)
+            m["_EXCL"] = ""
+        ganadores_v = cfg.get("_ganadores_vendedor")
+        if ganadores_v is not None and not ganadores_v.empty:
+            ya = m[claves].merge(ganadores_v.assign(_YA=True), on=claves, how="left")["_YA"].fillna(False)
+            m.loc[ya.to_numpy() & (m["_EXCL"] == "").to_numpy(), "_EXCL"] = "Ya gana como vendedor"
+    elegible = m["CUMPLE"] & (m["_EXCL"] == "")
+
     grupo = ["DEPARTAMENTO"] + (["DIA"] if diaria else [])
-    m["PUESTO_DEPTO"] = (m[m["CUMPLE"]].groupby(grupo)["HORA_CUOTA"]
+    m["PUESTO_DEPTO"] = (m[elegible].groupby(grupo)["HORA_CUOTA"]
                          .rank(method="first").reindex(m.index))
     grupo_general = ["DIA"] if diaria else None
-    llegada = m[m["CUMPLE"]]
+    llegada = m[elegible]
     m["PUESTO_GENERAL"] = ((llegada.groupby(grupo_general)["HORA_CUOTA"] if grupo_general
                             else llegada["HORA_CUOTA"]).rank(method="first").reindex(m.index))
-    gana_todos = m["CUMPLE"] & bool(cfg.get("gana_todos_cumplen"))
+    gana_todos = elegible & bool(cfg.get("gana_todos_cumplen"))
     gana_primero = m["PUESTO_DEPTO"].le(int(cfg.get("primeros_n", 1))) & bool(cfg.get("gana_primeros_depto"))
     m["GANA"] = gana_todos | gana_primero
     m["MOTIVO"] = [" + ".join(r for r, ok in (("Cumplió cuota", t), ("Primero(s) del departamento", p)) if ok)
                    for t, p in zip(gana_todos, gana_primero)]
+    excl = m["CUMPLE"] & (m["_EXCL"] != "")
+    m.loc[excl, "MOTIVO"] = "Cumplió, pero no gana: " + m.loc[excl, "_EXCL"]
     cupos = int(cfg.get("cupos") or 0)
     if cupos > 0:
         # entre los que ganarían, solo los primeros `cupos` en llegar a la cuota (por día si es diaria)
@@ -453,16 +605,26 @@ def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) ->
     return m
 
 
-def calcular(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def usa_recargas(cfg: dict) -> bool:
     cfg = completar_config(cfg)
+    return bool(cfg["recargas_vendedor"] or cfg["recargas_lider"])
+
+
+def calcular(df: pd.DataFrame, cfg: dict, recargas: pd.DataFrame | None = None) -> pd.DataFrame:
+    cfg = completar_config(cfg)
+    cfg["_recargas"] = recargas
     universo = df
     if cfg.get("estados"):
         universo = universo[universo["STATUS"].isin(cfg["estados"])]
     d = filtrar(df, cfg)
 
     partes = []
+    cfg["_ganadores_vendedor"] = None
     if cfg["participa_vendedor"]:
-        partes.append(_matriz_rol(d, universo, "Vendedor", cfg))
+        mv = _matriz_rol(d, universo, "Vendedor", cfg)
+        partes.append(mv)
+        claves = ["DNI"] + (["DIA"] if cfg["evaluacion"] == "diaria" else [])
+        cfg["_ganadores_vendedor"] = mv.loc[mv["GANA"], claves].drop_duplicates()
     if cfg["participa_lider"]:
         partes.append(_matriz_rol(d, universo, "Líder", cfg))
     if not partes:
@@ -475,6 +637,13 @@ def calcular(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         renombre[f"V_{p}"] = f"{p} VENTAS"
         renombre[f"Q_{p}"] = f"{p} CUOTA"
         cols += [f"V_{p}", f"Q_{p}"]
+        if p in cfg["recargas_vendedor"] or p in cfg["recargas_lider"]:
+            for c in (f"R_{p}", f"RQ_{p}"):
+                if c not in m:
+                    m[c] = pd.NA
+            renombre[f"R_{p}"] = f"{p} RECARGADAS"
+            renombre[f"RQ_{p}"] = f"{p} MIN RECARGADAS"
+            cols += [f"R_{p}", f"RQ_{p}"]
     cols += ["TOTAL_VENTAS", "AVANCE_%", "FALTAN", "CUMPLE", "HORA_CUOTA", "PUESTO_GENERAL", "PUESTO_DEPTO",
              "GANA", "MOTIVO", "PREMIO"]
     m = m[cols].rename(columns=renombre)
@@ -504,6 +673,8 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
     cfg = completar_config(cfg)
     filas = []
     for k, v in cfg.items():
+        if k.startswith("_"):
+            continue
         if k == "participantes":
             v = f"{len(v)} en lista" if v else "Todos los del Fanero"
         elif k == "planes":
@@ -514,6 +685,8 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
             v = ", ".join(map(str, v))
         filas.append((k, v))
     filas.append(("planes", "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()) or "Todos"))
+    filas.append(("recargas", "Consolidado, columna T (UR's). PREPAGO = UR's; PORTA PREPAGO = UR PORTA PP. "
+                  "Sin hora: cuenta el día completo"))
     filas.append(("regla_productos", "PREPAGO/POSTPAGO por TIPO ACTIVACION; PORTA PREPAGO/OSS por PRODUCTO"))
     return pd.DataFrame(filas, columns=["Parámetro", "Valor"])
 
