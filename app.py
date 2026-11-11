@@ -8,6 +8,7 @@ Sin DATABASE_URL usa un SQLite local (solo para pruebas).
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date
 
 import pandas as pd
@@ -41,17 +42,61 @@ def motor():
 eng = motor()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def ventas_cacheadas(desde, hasta, _version):
+# --- Caché: nada pesado se repite en cada clic -------------------------------
+# `version` = id de la última carga; cambia solo cuando se suben o borran ventas,
+# y así todas las sesiones ven datos frescos sin recalcular en cada interacción.
+def version_datos() -> int:
+    return db.ultima_version(eng)
+
+
+@st.cache_data(ttl=3600, show_spinner="Leyendo ventas...", max_entries=6)
+def ventas_cacheadas(desde, hasta, version):
     return db.leer_ventas(eng, desde, hasta)
 
 
-if "version_datos" not in st.session_state:
-    st.session_state.version_datos = 0
+@st.cache_data(ttl=3600, show_spinner="Calculando incentivo...", max_entries=20)
+def matriz_cacheada(cfg_json: str, version: int):
+    cfg = core.completar_config(json.loads(cfg_json))
+    ventas = ventas_cacheadas(cfg["fecha_inicio"], cfg["fecha_fin"], version)
+    if ventas.empty:
+        return None, 0
+    en_rango = core.filtrar(ventas, cfg)
+    mask = pd.Series(False, index=en_rango.index)
+    for p in cfg["productos"]:
+        mask |= core.mascara_producto(en_rango, p, cfg["planes"].get(p))
+    rec = recargas_cacheadas(cfg["fecha_inicio"], cfg["fecha_fin"], version) if core.usa_recargas(cfg) else None
+    return core.calcular(ventas, cfg, rec), int(mask.sum())
+
+
+@st.cache_data(ttl=3600, show_spinner="Leyendo recargas...", max_entries=6)
+def recargas_cacheadas(desde, hasta, version):
+    return db.leer_recargas(eng, desde, hasta)
+
+
+@st.cache_data(ttl=3600, show_spinner="Preparando Excel...", max_entries=20)
+def excel_cacheado(cfg_json: str, version: int) -> bytes:
+    matriz, _ = matriz_cacheada(cfg_json, version)
+    return core.a_excel(matriz, json.loads(cfg_json))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def catalogos(version: int):
+    return {
+        "estados": db.valores_distintos(eng, "status") or ["Completada"],
+        "deptos": db.valores_distintos(eng, "department"),
+        "planes": core.planes_disponibles(db.planes_vistos(eng)),
+        "resumen": db.resumen_ventas(eng),
+        "historial": db.historial_cargas(eng),
+        "recargas": db.resumen_recargas(eng),
+    }
+
+
+@st.cache_data(show_spinner="Leyendo archivo...", max_entries=3)
+def leer_fanero(nombre: str, contenido: bytes) -> pd.DataFrame:
+    return core.normalizar(core.leer_archivo(nombre, contenido))
 
 
 def datos_cambiaron():
-    st.session_state.version_datos += 1
     st.cache_data.clear()
 
 
@@ -103,7 +148,7 @@ with tab_carga:
         archivo = st.file_uploader("Archivo Fanero", type=["xlsx", "xls", "csv", "txt"])
         if archivo:
             try:
-                df = core.normalizar(core.leer_archivo(archivo.name, archivo.getvalue()))
+                df = leer_fanero(archivo.name, archivo.getvalue())
             except Exception as e:
                 st.error(f"No pude leer el archivo: {e}")
                 df = None
@@ -127,15 +172,61 @@ with tab_carga:
                 st.warning("El archivo no tiene filas válidas.")
 
         st.divider()
+        st.subheader("Subir el Consolidado (recargas)")
+        st.caption("Solo si algún incentivo exige prepagos recargados. Se usa la columna T (UR's). "
+                   "Las fechas que trae el archivo reemplazan las recargas ya guardadas de esas fechas.")
+        arch_c = st.file_uploader("Archivo Consolidado", type=["xlsx", "xls", "csv"], key="consolidado")
+        if arch_c:
+            try:
+                crudo, (mes_d, anio_d), filtros = core.leer_consolidado(arch_c.name, arch_c.getvalue())
+            except Exception as e:
+                st.error(f"No pude leer el Consolidado: {e}")
+                crudo = None
+            if crudo is not None:
+                hoy = date.today()
+                c1, c2 = st.columns(2)
+                meses = list(range(1, 13))
+                mes = c1.selectbox("Mes de las ventas", meses, index=(mes_d or hoy.month) - 1,
+                                   format_func=lambda m: ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
+                                                          "Agosto", "Setiembre", "Octubre", "Noviembre",
+                                                          "Diciembre"][m - 1])
+                anio = c2.number_input("Año", 2024, 2100, anio_d or hoy.year)
+                if mes_d:
+                    st.caption(f"Mes detectado del filtro del archivo: {mes_d:02d}/{anio_d}. "
+                               "El Consolidado solo trae el número de día; cámbialo si no corresponde.")
+                else:
+                    st.warning("No pude detectar el mes en el archivo. Elige el mes de las ventas.")
+                try:
+                    rec = core.normalizar_consolidado(crudo, int(mes), int(anio))
+                except Exception as e:
+                    st.error(str(e))
+                    rec = None
+                if rec is not None and not rec.empty:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Filas", f"{len(rec):,}")
+                    c2.metric("Desde", rec["FECHA"].min().strftime("%d/%m/%Y"))
+                    c3.metric("Hasta", rec["FECHA"].max().strftime("%d/%m/%Y"))
+                    c4.metric("Prepagos recargados", f"{int(rec['UR_PREPAGO'].sum()):,}")
+                    if st.button("Guardar recargas", type="primary"):
+                        with st.spinner("Guardando..."):
+                            r = db.guardar_recargas(eng, rec, arch_c.name)
+                        datos_cambiaron()
+                        st.success(f"Listo: recargas del {r['desde']:%d/%m/%Y} al {r['hasta']:%d/%m/%Y} guardadas "
+                                   f"({r['ur']:,} prepagos recargados).")
+                elif rec is not None:
+                    st.warning("El Consolidado no tiene filas válidas.")
+
+        st.divider()
         st.subheader("Ventas guardadas por día")
-        rv = db.resumen_ventas(eng)
+        cat = catalogos(version_datos())
+        rv = cat["resumen"].copy()
         if rv.empty:
             st.info("Todavía no hay ventas cargadas.")
         else:
             rv["fecha"] = pd.to_datetime(rv["fecha"])
             st.bar_chart(rv.set_index("fecha")["ventas"], color=AZUL)
             with st.expander("Historial de cargas"):
-                st.dataframe(db.historial_cargas(eng), width="stretch", hide_index=True)
+                st.dataframe(cat["historial"], width="stretch", hide_index=True)
             with st.expander("Borrar ventas de un rango de fechas"):
                 rango = st.date_input("Rango a borrar", value=(), format="DD/MM/YYYY", key="borrar")
                 if len(rango) == 2 and st.button("Borrar definitivamente"):
@@ -155,9 +246,8 @@ with tab_inc:
         cfg0 = core.completar_config(actual["config"] if actual else {})
         clave_form = f"form_inc_{actual['id'] if actual else 'nuevo'}"
 
-        estados_bd = db.valores_distintos(eng, "status") or ["Completada"]
-        deptos_bd = db.valores_distintos(eng, "department")
-        planes_disp = core.planes_disponibles(db.planes_vistos(eng))
+        cat = catalogos(version_datos())
+        estados_bd, deptos_bd, planes_disp = cat["estados"], cat["deptos"], cat["planes"]
 
         with st.form(clave_form):
             nombre = st.text_input("Nombre del incentivo", cfg0["nombre"],
@@ -213,6 +303,24 @@ with tab_inc:
                     if pl:
                         planes_sel[p] = pl
 
+            st.markdown("**Recargas mínimas** (Consolidado, columna T) — 0 = no se exige")
+            st.caption("Cuántas de esas ventas deben estar recargadas. Respeta fechas, planes y departamentos "
+                       "del incentivo; el Consolidado no tiene hora, así que cuenta el día completo. "
+                       "Sube el Consolidado en Cargar ventas.")
+            rec_v, rec_l = {}, {}
+            for p in core.RECARGABLES:
+                f = st.columns([1.3, 1, 1, 3])
+                f[0].markdown(f"{p.title()} recargados")
+                rv_ = f[1].number_input("Mín. recargas vendedor", 0, 10000,
+                                        int(cfg0["recargas_vendedor"].get(p, 0)),
+                                        key=f"{clave_form}_rv_{p}", label_visibility="collapsed")
+                rl_ = f[2].number_input("Mín. recargas líder", 0, 100000, int(cfg0["recargas_lider"].get(p, 0)),
+                                        key=f"{clave_form}_rl_{p}", label_visibility="collapsed")
+                if rv_:
+                    rec_v[p] = int(rv_)
+                if rl_:
+                    rec_l[p] = int(rl_)
+
             st.markdown("**Participantes**")
             c1, c2 = st.columns(2)
             p_vend = c1.checkbox("Participan vendedores (LOGIN)", cfg0["participa_vendedor"])
@@ -262,6 +370,9 @@ with tab_inc:
                 errores.append("La hora desde no puede ser mayor que la hora hasta.")
             if not elegidos:
                 errores.append("Marca al menos un producto.")
+            for p in set(rec_v) | set(rec_l):
+                if p not in elegidos:
+                    errores.append(f"Pusiste recargas mínimas de {p.title()} pero ese producto no está marcado.")
             if not (p_vend or p_lid):
                 errores.append("Marca al menos un tipo de participante.")
             if not (g_todos or g_prim):
@@ -274,6 +385,8 @@ with tab_inc:
                            hora_desde=h1, hora_hasta=h2, evaluacion=evaluacion, estados=estados,
                            departamentos=deptos, productos=elegidos, planes=planes_sel,
                            cuotas_vendedor=cuotas_v, cuotas_lider=cuotas_l,
+                           recargas_vendedor={k: v for k, v in rec_v.items() if k in elegidos},
+                           recargas_lider={k: v for k, v in rec_l.items() if k in elegidos},
                            participa_vendedor=p_vend, participa_lider=p_lid,
                            gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim), cupos=int(cupos),
                            premio_vendedor=premio_v, premio_lider=premio_l,
@@ -281,6 +394,9 @@ with tab_inc:
                 db.guardar_incentivo(eng, cfg, actual["id"] if actual else None)
                 for a in avisos:
                     st.warning(a)
+                if p_lid and any(v <= 1 for v in cuotas_l.values()):
+                    st.warning("Ojo: participan líderes con cuota de 1. Revisa que sea a propósito; "
+                               "si el incentivo es solo para vendedores, desmarca Participan líderes.")
                 st.success(f"Incentivo guardado con {len(participantes) or 'todos los'} participantes. "
                            "Míralo en la pestaña Resultados.")
 
@@ -300,6 +416,10 @@ def describir(cfg: dict) -> str:
         partes.append("cuota diaria")
     if cfg["planes"]:
         partes.append("📋 " + "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()))
+    if cfg["recargas_vendedor"] or cfg["recargas_lider"]:
+        r = [f"vendedor {p} {n}" for p, n in cfg["recargas_vendedor"].items()]
+        r += [f"líder {p} {n}" for p, n in cfg["recargas_lider"].items()]
+        partes.append("🔋 recargadas mín. " + ", ".join(r))
     if cfg["participa_vendedor"]:
         partes.append("🎯 vendedor " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_vendedor"].items()))
     if cfg["participa_lider"]:
@@ -323,30 +443,40 @@ with tab_res:
     else:
         sel = st.selectbox("Incentivo", incs, format_func=lambda i: f"{i['id']} · {i['nombre']}")
         cfg = core.completar_config(sel["config"])
+        cfg_json = json.dumps(cfg, sort_keys=True, default=str, ensure_ascii=False)
         st.caption(describir(cfg))
 
-        ventas_df = ventas_cacheadas(cfg["fecha_inicio"], cfg["fecha_fin"], st.session_state.version_datos)
-        if ventas_df.empty:
+        version = version_datos()
+        if core.usa_recargas(cfg):
+            rr = catalogos(version)["recargas"]
+            if rr.empty:
+                st.warning("Este incentivo exige recargas, pero no hay ningún Consolidado cargado. "
+                           "Súbelo en Cargar ventas; mientras tanto, nadie cumple la recarga.")
+            else:
+                fechas_r = set(pd.to_datetime(rr["fecha"]).dt.date)
+                pedidas = set(pd.date_range(cfg["fecha_inicio"], cfg["fecha_fin"]).date)
+                faltan = sorted(pedidas - fechas_r)
+                if faltan:
+                    st.warning("Faltan recargas del Consolidado para: "
+                               + ", ".join(d.strftime("%d/%m") for d in faltan))
+        matriz, n_rango = matriz_cacheada(cfg_json, version)
+        if matriz is None:
             st.warning("No hay ventas cargadas para esas fechas.")
         else:
-            matriz = core.calcular(ventas_df, cfg)
-            ganadores = matriz[matriz["GANA"] == "Sí"]
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Participantes", f"{len(matriz):,}")
             c2.metric("Cumplen cuota", f"{(matriz['CUMPLE'] == 'Sí').sum():,}")
-            c3.metric("Ganadores", f"{len(ganadores):,}")
-            en_rango = core.filtrar(ventas_df, cfg)
-            mask = pd.Series(False, index=en_rango.index)
-            for p in cfg["productos"]:
-                mask |= core.mascara_producto(en_rango, p, cfg["planes"].get(p))
-            c4.metric("Ventas en el rango", f"{int(mask.sum()):,}",
+            c3.metric("Ganadores", f"{(matriz['GANA'] == 'Sí').sum():,}")
+            c4.metric("Ventas en el rango", f"{n_rango:,}",
                       help="Ventas de los productos del incentivo dentro de las fechas y horas")
 
-            c1, c2, c3, c4 = st.columns(4)
-            f_rol = c1.multiselect("Rol", sorted(matriz["ROL"].unique()))
-            f_dep = c2.multiselect("Departamento", sorted(matriz["DEPARTAMENTO"].unique()))
-            f_gana = c3.selectbox("Mostrar", ["Todos", "Solo ganadores", "Solo no ganadores"])
-            f_dni = c4.text_input("Buscar DNI o nombre")
+            with st.form("filtros_resultados", border=False):
+                c1, c2, c3, c4 = st.columns(4)
+                f_rol = c1.multiselect("Rol", sorted(matriz["ROL"].unique()))
+                f_dep = c2.multiselect("Departamento", sorted(matriz["DEPARTAMENTO"].unique()))
+                f_gana = c3.selectbox("Mostrar", ["Todos", "Solo ganadores", "Solo no ganadores"])
+                f_dni = c4.text_input("Buscar DNI o nombre")
+                st.form_submit_button("Aplicar filtros")
             vista = matriz
             if f_rol:
                 vista = vista[vista["ROL"].isin(f_rol)]
@@ -357,24 +487,22 @@ with tab_res:
             elif f_gana == "Solo no ganadores":
                 vista = vista[vista["GANA"] == "No"]
             if f_dni:
-                b = f_dni.strip()
-                vista = vista[vista["DNI"].fillna("").str.contains(b, regex=False) | vista["LIDER"].fillna("").str.contains(b, regex=False)
-                              | vista["NOMBRE"].fillna("").str.contains(b, case=False, regex=False)]
+                b = f_dni.strip().lstrip("0")
+                vista = vista[vista["DNI"].fillna("").str.contains(b, regex=False)
+                              | vista["LIDER"].fillna("").str.contains(b, regex=False)
+                              | vista["NOMBRE"].fillna("").str.contains(f_dni.strip(), case=False, regex=False)]
 
-            def pintar(fila):
-                color = "background-color: #DCEFF8" if fila["GANA"] == "Sí" else ""
-                return [color] * len(fila)
-
+            st.caption(f"Mostrando {len(vista):,} de {len(matriz):,} filas. Los ganadores aparecen primero.")
             st.dataframe(
-                vista.style.apply(pintar, axis=1),
-                width="stretch", hide_index=True, height=520,
+                vista, width="stretch", hide_index=True, height=520,
                 column_config={
-                    "AVANCE_%": st.column_config.ProgressColumn("Avance (producto más atrasado)", format="%.0f%%",
-                                                                min_value=0, max_value=100),
+                    "GANA": st.column_config.TextColumn("Gana", help="Sí = ganador"),
                     "HORA_CUOTA": st.column_config.DatetimeColumn("Llegó a la cuota",
                                                                   format="DD/MM/YYYY HH:mm:ss"),
                     "PUESTO_DEPTO": st.column_config.NumberColumn("Puesto depto"),
                     "PUESTO_GENERAL": st.column_config.NumberColumn("Puesto general"),
+                    "AVANCE_%": st.column_config.ProgressColumn("Avance (lo más atrasado)", format="%.0f%%",
+                                                                min_value=0, max_value=100),
                     "LIDER": "Líder",
                     "DIA": st.column_config.DateColumn("Día", format="DD/MM/YYYY"),
                 })
@@ -382,9 +510,16 @@ with tab_res:
             with st.expander("Resumen por departamento"):
                 st.dataframe(core.resumen(matriz), width="stretch", hide_index=True)
 
-            st.download_button(
-                "⬇️ Descargar matriz en Excel",
-                core.a_excel(matriz, cfg),
-                file_name=f"incentivo_{sel['id']}_{cfg['nombre'][:30].replace(' ', '_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary")
+            # El Excel se arma solo cuando lo pides, y queda guardado para la siguiente descarga
+            clave_xl = f"xl_{sel['id']}_{version}_{hash(cfg_json)}"
+            if st.session_state.get("xl_listo") != clave_xl:
+                if st.button("📄 Preparar Excel de la matriz", type="primary"):
+                    st.session_state["xl_listo"] = clave_xl
+                    st.rerun()
+            else:
+                st.download_button(
+                    "⬇️ Descargar matriz en Excel",
+                    excel_cacheado(cfg_json, version),
+                    file_name=f"incentivo_{sel['id']}_{cfg['nombre'][:30].replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary")

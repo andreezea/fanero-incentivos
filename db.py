@@ -35,6 +35,15 @@ ventas = Table(
     Column("carga_id", Integer),
 )
 
+recargas = Table(
+    "fanero_recargas", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("login", String, index=True), Column("leader", String, index=True),
+    Column("fecha", Date, index=True), Column("tariffplanname", String),
+    Column("department", String), Column("ur_prepago", Integer), Column("ur_porta", Integer),
+    Column("carga_id", Integer),
+)
+
 cargas = Table(
     "fanero_cargas", meta,
     Column("id", Integer, primary_key=True, autoincrement=True),
@@ -93,8 +102,13 @@ def guardar_ventas(eng, df_norm: pd.DataFrame, archivo: str) -> dict:
             "dias": len(fechas)}
 
 
-def leer_ventas(eng, desde=None, hasta=None) -> pd.DataFrame:
-    q = select(*[ventas.c[c] for c in COLS_VENTAS])
+# columnas que usa el cálculo (traer menos datos de Neon = carga más rápida)
+COLS_CALCULO = ["status", "requeststarthour", "fecha", "fecha_hora", "login", "leader",
+                "department", "tipo_activacion", "producto", "tariffplanname"]
+
+
+def leer_ventas(eng, desde=None, hasta=None, columnas=None) -> pd.DataFrame:
+    q = select(*[ventas.c[c] for c in (columnas or COLS_CALCULO)])
     if desde:
         q = q.where(ventas.c.fecha >= desde)
     if hasta:
@@ -131,6 +145,54 @@ def planes_vistos(eng) -> pd.DataFrame:
     return df
 
 
+def ultima_version(eng) -> int:
+    """Cambia cada vez que se sube o borra algo (sirve de llave para la caché)."""
+    with eng.connect() as cx:
+        n = cx.execute(select(cargas.c.id).order_by(cargas.c.id.desc()).limit(1)).scalar()
+    return int(n or 0)
+
+
+def guardar_recargas(eng, rec: pd.DataFrame, archivo: str) -> dict:
+    """Reemplaza las recargas de los días que trae el Consolidado."""
+    fechas = sorted(set(rec["FECHA"]))
+    with eng.begin() as cx:
+        borradas = cx.execute(delete(recargas).where(recargas.c.fecha.in_(fechas))).rowcount
+        cid = cx.execute(insert(cargas).values(
+            archivo=f"CONSOLIDADO: {archivo}", filas=len(rec), fecha_desde=fechas[0], fecha_hasta=fechas[-1],
+            reemplazadas=borradas, creado=datetime.now())).inserted_primary_key[0]
+        filas = [{"login": r.LOGIN, "leader": r.LEADER, "fecha": r.FECHA, "tariffplanname": r.TARIFFPLANNAME,
+                  "department": r.DEPARTMENT, "ur_prepago": int(r.UR_PREPAGO), "ur_porta": int(r.UR_PORTA),
+                  "carga_id": cid} for r in rec.itertuples(index=False)]
+        for i in range(0, len(filas), 5000):
+            cx.execute(insert(recargas), filas[i:i + 5000])
+    return {"filas": len(rec), "desde": fechas[0], "hasta": fechas[-1], "reemplazadas": borradas,
+            "ur": int(rec["UR_PREPAGO"].sum())}
+
+
+def leer_recargas(eng, desde=None, hasta=None) -> pd.DataFrame:
+    q = select(recargas.c.login, recargas.c.leader, recargas.c.fecha, recargas.c.tariffplanname,
+               recargas.c.department, recargas.c.ur_prepago, recargas.c.ur_porta)
+    if desde:
+        q = q.where(recargas.c.fecha >= desde)
+    if hasta:
+        q = q.where(recargas.c.fecha <= hasta)
+    with eng.connect() as cx:
+        df = pd.read_sql(q, cx)
+    df.columns = ["LOGIN", "LEADER", "FECHA", "TARIFFPLANNAME", "DEPARTMENT", "UR_PREPAGO", "UR_PORTA"]
+    df["FECHA"] = pd.to_datetime(df["FECHA"]).dt.date
+    for c in ("LOGIN", "LEADER"):
+        df[c] = core._limpiar_id(df[c])
+    df["DEPARTMENT"] = df["DEPARTMENT"].map(core.sin_tildes)
+    df["TARIFFPLANNAME"] = df["TARIFFPLANNAME"].fillna("")
+    return df
+
+
+def resumen_recargas(eng) -> pd.DataFrame:
+    with eng.connect() as cx:
+        return pd.read_sql("SELECT fecha, SUM(ur_prepago) AS recargadas FROM fanero_recargas "
+                           "GROUP BY fecha ORDER BY fecha", cx)
+
+
 def historial_cargas(eng) -> pd.DataFrame:
     with eng.connect() as cx:
         return pd.read_sql(select(cargas).order_by(cargas.c.id.desc()), cx)
@@ -138,7 +200,11 @@ def historial_cargas(eng) -> pd.DataFrame:
 
 def borrar_rango(eng, desde, hasta) -> int:
     with eng.begin() as cx:
-        return cx.execute(delete(ventas).where(ventas.c.fecha.between(desde, hasta))).rowcount
+        n = cx.execute(delete(ventas).where(ventas.c.fecha.between(desde, hasta))).rowcount
+        # queda en el historial y cambia la versión de los datos
+        cx.execute(insert(cargas).values(archivo="BORRADO MANUAL", filas=0, fecha_desde=desde,
+                                         fecha_hasta=hasta, reemplazadas=n, creado=datetime.now()))
+    return n
 
 
 def guardar_incentivo(eng, cfg: dict, inc_id: int | None = None) -> int:
