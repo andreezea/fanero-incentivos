@@ -14,8 +14,15 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+import importlib
+
 import core
 import db
+
+# Streamlit Cloud a veces mantiene en memoria versiones viejas de core.py y db.py
+# después de actualizar el repo; se recargan para usar siempre las del repo.
+core = importlib.reload(core)
+db = importlib.reload(db)
 
 AZUL = "#00679E"
 st.set_page_config(page_title="Incentivos Fanero", page_icon="logo.jpg", layout="wide")
@@ -35,11 +42,11 @@ def _secret(nombre, defecto=None):
 
 
 @st.cache_resource
-def motor():
+def motor(_version_codigo: str = ""):
     return db.get_engine(_secret("DATABASE_URL", "sqlite:///incentivos_local.db"))
 
 
-eng = motor()
+eng = motor(str(sorted(n for n in dir(db) if not n.startswith("_"))))
 
 
 # --- Caché: nada pesado se repite en cada clic -------------------------------
