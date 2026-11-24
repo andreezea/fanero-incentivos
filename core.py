@@ -25,11 +25,11 @@ import pandas as pd
 
 COLUMNAS_REQUERIDAS = [
     "STATUS", "REQUESTSTARTHOUR", "LASTSTATUSMODDATE", "LASTSTATUSMODHOUR",
-    "LOGIN", "TARIFFPLANNAME", "LEADER", "DEPARTMENT", "TIPO ACTIVACION", "PRODUCTO",
+    "LOGIN", "TARIFFPLANNAME", "LEADER", "DEPARTMENT", "TIPO ACTIVACION", "PORTABILIDAD", "PRODUCTO",
 ]
 COLUMNAS_OPCIONALES = [
     "ACTIVATIONTYPE", "PARTNER", "USERTYPE", "LATITUDE",
-    "LONGITUDE", "PORTABILIDAD", "CANAL", "PROVINCIA", "DISTRITO", "FUENTE UBICACION",
+    "LONGITUDE", "CANAL", "PROVINCIA", "DISTRITO", "FUENTE UBICACION",
 ]
 
 # producto -> (columna del Fanero, valor)
@@ -74,6 +74,20 @@ def planes_disponibles(df: pd.DataFrame) -> dict:
 #   PREPAGO       -> UR's (= UR VR PP + UR PORTA PP), igual que la regla de la columna N
 #   PORTA PREPAGO -> Suma de UR PORTA PP
 RECARGABLES = {"PREPAGO": "UR_PREPAGO", "PORTA PREPAGO": "UR_PORTA"}
+
+
+# Origen de la venta postpago (columna O, PORTABILIDAD; OSS también por PRODUCTO)
+ORIGENES_POSTPAGO = ["VENTA REGULAR", "OPP", "OSS"]
+
+
+def origen_postpago(df: pd.DataFrame) -> pd.Series:
+    """VENTA REGULAR (sin portabilidad), OPP u OSS; otro valor de PORTABILIDAD se deja tal cual."""
+    port = df["PORTABILIDAD"].map(sin_tildes) if "PORTABILIDAD" in df else pd.Series("", index=df.index)
+    prod = df["PRODUCTO"].map(sin_tildes)
+    out = port.where(~port.isin(["", "NINGUNO", "NINGUNA", "NONE", "NAN"]), "VENTA REGULAR")
+    out = out.mask(port.str.contains("OPP", na=False) | (prod == "OPP"), "OPP")
+    out = out.mask(port.str.contains("OSS", na=False) | (prod == "OSS"), "OSS")
+    return out
 
 
 def slug(producto: str) -> str:
@@ -177,6 +191,8 @@ def desde_bd(df: pd.DataFrame) -> pd.DataFrame:
     out["REQUESTSTARTHOUR"] = pd.to_numeric(out["REQUESTSTARTHOUR"], errors="coerce").astype("Int64")
     for c in ("TIPO ACTIVACION", "PRODUCTO", "DEPARTMENT"):
         out[c] = out[c].map(sin_tildes)
+    if "PORTABILIDAD" in out:
+        out["PORTABILIDAD"] = out["PORTABILIDAD"].map(sin_tildes)
     out["LOGIN"] = _limpiar_id(out["LOGIN"])
     out["LEADER"] = _limpiar_id(out["LEADER"])
     return out
@@ -390,16 +406,21 @@ def completar_config(cfg: dict) -> dict:
         cfg[clave] = {p: int(r.get(p) or 0) for p in cfg["productos"] if p in RECARGABLES and int(r.get(p) or 0) > 0}
     planes = cfg.get("planes") or {}
     cfg["planes"] = {p: list(planes.get(p) or []) for p in cfg["productos"] if planes.get(p)}
+    origenes = cfg.get("origenes") or {}
+    cfg["origenes"] = {"POSTPAGO": list(origenes.get("POSTPAGO") or [])} \
+        if "POSTPAGO" in cfg["productos"] and origenes.get("POSTPAGO") else {}
     return cfg
 
 
-def mascara_producto(df: pd.DataFrame, producto: str, planes=None) -> pd.Series:
-    """Filas que cuentan para el producto; si se dan planes, solo esos planes."""
+def mascara_producto(df: pd.DataFrame, producto: str, planes=None, origenes=None) -> pd.Series:
+    """Filas que cuentan para el producto; si se dan planes u orígenes (postpago), solo esos."""
     col, valor = PRODUCTOS[producto]
     m = df[col] == valor
     if planes:
         elegidos = {clave_plan(x) for x in planes}
         m &= df["TARIFFPLANNAME"].map(clave_plan).isin(elegidos)
+    if origenes and producto == "POSTPAGO":
+        m &= origen_postpago(df).isin({sin_tildes(o) for o in origenes})
     return m
 
 
@@ -509,7 +530,7 @@ def _matriz_rol(d: pd.DataFrame, universo: pd.DataFrame, rol: str, cfg: dict) ->
     d["DNI"] = d[col]
     d["DIA"] = d["LASTSTATUSMODDATE"]
     for p in prods:
-        dp = d[mascara_producto(d, p, cfg["planes"].get(p))].copy()
+        dp = d[mascara_producto(d, p, cfg["planes"].get(p), cfg["origenes"].get(p))].copy()
         conteo = dp.groupby(claves).size().rename(f"V_{p}").reset_index()
         m = m.merge(conteo, on=claves, how="left")
         m[f"V_{p}"] = m[f"V_{p}"].fillna(0).astype(int)
@@ -677,7 +698,7 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
             continue
         if k == "participantes":
             v = f"{len(v)} en lista" if v else "Todos los del Fanero"
-        elif k == "planes":
+        elif k in ("planes", "origenes"):
             continue
         elif isinstance(v, dict):
             v = ", ".join(f"{p}: {n}" for p, n in v.items())
@@ -685,6 +706,7 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
             v = ", ".join(map(str, v))
         filas.append((k, v))
     filas.append(("planes", "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()) or "Todos"))
+    filas.append(("origen_postpago", ", ".join(cfg["origenes"].get("POSTPAGO", [])) or "Todos (venta regular, OPP y OSS)"))
     filas.append(("recargas", "Consolidado, columna T (UR's). PREPAGO = UR's; PORTA PREPAGO = UR PORTA PP. "
                   "Sin hora: cuenta el día completo"))
     filas.append(("regla_productos", "PREPAGO/POSTPAGO por TIPO ACTIVACION; PORTA PREPAGO/OSS por PRODUCTO"))
