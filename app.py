@@ -367,7 +367,47 @@ with tab_inc:
                                             type=["xlsx", "xls", "csv"])
             quitar_lista = st.checkbox("Quitar la lista y que compitan todos", False) if n_lista else False
 
-            st.markdown("**Quiénes ganan** (puedes marcar ambas)")
+            st.markdown("**Tipo de premio**")
+            modos = ["cuota", "niveles"]
+            modo = st.radio("Tipo de premio", modos, index=modos.index(cfg0.get("modo", "cuota")),
+                            horizontal=True, label_visibility="collapsed",
+                            format_func=lambda x: "Cumple la cuota → premio fijo" if x == "cuota"
+                            else "Por niveles → precio por unidad según el nivel")
+            st.caption("**Por niveles:** gana el nivel más alto que alcance (mínimo del producto base y, si se pide, "
+                       "mínimo del producto requisito). Pago = ventas del producto base × precio del nivel, "
+                       "con tope en el máximo del nivel. En este modo no se usan las cuotas ni las opciones de "
+                       "'Quiénes ganan'; las recargas mínimas sí se exigen.")
+            c1, c2 = st.columns(2)
+            opciones_prod = list(core.PRODUCTOS)
+            n_base = c1.selectbox("Producto base (rangos y precio)", opciones_prod,
+                                  index=opciones_prod.index(cfg0.get("nivel_base") or "PREPAGO"),
+                                  format_func=str.title)
+            opciones_req = ["(ninguno)"] + opciones_prod
+            req0 = cfg0.get("nivel_req") or "(ninguno)"
+            n_req = c2.selectbox("Producto requisito (columna 'Mín. requisito')", opciones_req,
+                                 index=opciones_req.index(req0) if req0 in opciones_req else 0,
+                                 format_func=lambda x: x if x.startswith("(") else x.title())
+            niveles0 = cfg0.get("niveles") or [   # ejemplo editable: PP y OSS
+                {"nivel": "Nivel 1", "min": 3, "max": 3, "req_min": 0, "precio": 3.0},
+                {"nivel": "Nivel 2", "min": 5, "max": 5, "req_min": 0, "precio": 3.0},
+                {"nivel": "Nivel 3", "min": 6, "max": 8, "req_min": 0, "precio": 3.5},
+                {"nivel": "Nivel 4", "min": 9, "max": 11, "req_min": 0, "precio": 3.5},
+                {"nivel": "Nivel 5", "min": 12, "max": 39, "req_min": 1, "precio": 4.0},
+                {"nivel": "Nivel 6", "min": 40, "max": 45, "req_min": 2, "precio": 4.5},
+            ]
+            tabla_niv = st.data_editor(
+                pd.DataFrame(niveles0, columns=["nivel", "min", "max", "req_min", "precio"]),
+                num_rows="dynamic", hide_index=True, width="stretch", key=f"{clave_form}_niveles",
+                column_config={
+                    "nivel": st.column_config.TextColumn("Nivel"),
+                    "min": st.column_config.NumberColumn("Mín. base", min_value=0, step=1),
+                    "max": st.column_config.NumberColumn("Máx. base (tope de pago)", min_value=0, step=1),
+                    "req_min": st.column_config.NumberColumn("Mín. requisito", min_value=0, step=1),
+                    "precio": st.column_config.NumberColumn("Precio por unidad (S/)", min_value=0.0,
+                                                            step=0.1, format="%.2f"),
+                })
+
+            st.markdown("**Quiénes ganan** (modo cuota; puedes marcar ambas)")
             c1, c2 = st.columns(2)
             g_todos = c1.checkbox("Todos los que lleguen a la cuota", cfg0["gana_todos_cumplen"])
             g_prim = c2.checkbox("Los primeros en llegar a la cuota en cada departamento",
@@ -406,7 +446,10 @@ with tab_inc:
                     errores.append(f"Pusiste recargas mínimas de {p.title()} pero ese producto no está marcado.")
             if not (p_vend or p_lid):
                 errores.append("Marca al menos un tipo de participante.")
-            if not (g_todos or g_prim):
+            niveles_sel = core.limpiar_niveles(tabla_niv.to_dict("records")) if modo == "niveles" else []
+            if modo == "niveles" and not niveles_sel:
+                errores.append("En modo por niveles, completa al menos un nivel con mínimo y precio.")
+            if modo == "cuota" and not (g_todos or g_prim):
                 errores.append("Marca al menos una forma de ganar.")
             if errores:
                 for e in errores:
@@ -420,6 +463,8 @@ with tab_inc:
                            recargas_lider={k: v for k, v in rec_l.items() if k in elegidos},
                            participa_vendedor=p_vend, participa_lider=p_lid,
                            gana_todos_cumplen=g_todos, gana_primeros_depto=g_prim, primeros_n=int(n_prim), cupos=int(cupos),
+                           modo=modo, niveles=niveles_sel, nivel_base=n_base,
+                           nivel_req="" if n_req.startswith("(") else n_req,
                            premio_vendedor=premio_v, premio_lider=premio_l,
                            participantes=participantes)
                 db.guardar_incentivo(eng, cfg, actual["id"] if actual else None)
@@ -457,6 +502,11 @@ def describir(cfg: dict) -> str:
         partes.append("🎯 vendedor " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_vendedor"].items()))
     if cfg["participa_lider"]:
         partes.append("🎯 líder " + ", ".join(f"{p} {n}" for p, n in cfg["cuotas_lider"].items()))
+    if cfg["modo"] == "niveles":
+        req = f" + {cfg['nivel_req'].title()}" if cfg["nivel_req"] else ""
+        partes.append(f"🪜 {len(cfg['niveles'])} niveles por {cfg['nivel_base'].title()}{req}")
+        partes.append(f"👥 {len(cfg['participantes'])} en lista" if cfg["participantes"] else "👥 todos los del Fanero")
+        return "  |  ".join(p for p in partes if not p.startswith("🎯"))
     gana = []
     if cfg["gana_todos_cumplen"]:
         gana.append("todos los que cumplen")
@@ -502,7 +552,10 @@ with tab_res:
         else:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Participantes", f"{len(matriz):,}")
-            c2.metric("Cumplen cuota", f"{(matriz['CUMPLE'] == 'Sí').sum():,}")
+            if "PAGO" in matriz:
+                c2.metric("Total a pagar", f"S/ {matriz['PAGO'].sum():,.2f}")
+            else:
+                c2.metric("Cumplen cuota", f"{(matriz['CUMPLE'] == 'Sí').sum():,}")
             c3.metric("Ganadores", f"{(matriz['GANA'] == 'Sí').sum():,}")
             c4.metric("Ventas en el rango", f"{n_rango:,}",
                       help="Ventas de los productos del incentivo dentro de las fechas y horas")
@@ -538,6 +591,8 @@ with tab_res:
                                                                   format="DD/MM/YYYY HH:mm:ss"),
                     "PUESTO_DEPTO": st.column_config.NumberColumn("Puesto depto"),
                     "PUESTO_GENERAL": st.column_config.NumberColumn("Puesto general"),
+                    "PAGO": st.column_config.NumberColumn("Pago (S/)", format="%.2f"),
+                    "PRECIO_UNIT": st.column_config.NumberColumn("Precio unit. (S/)", format="%.2f"),
                     "AVANCE_%": st.column_config.ProgressColumn("Avance (lo más atrasado)", format="%.0f%%",
                                                                 min_value=0, max_value=100),
                     "LIDER": "Líder",
