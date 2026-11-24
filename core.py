@@ -390,15 +390,58 @@ CONFIG_DEFECTO = {
     "gana_primeros_depto": False,
     "primeros_n": 1,
     "cupos": 0,                    # 0 = sin límite; si no, solo los primeros N ganadores en llegar
+    "modo": "cuota",               # "cuota" (cumple/no cumple, premio fijo) o "niveles"
+    "nivel_base": "PREPAGO",       # producto cuyos rangos y precio por unidad definen el nivel
+    "nivel_req": "OSS",            # producto que se exige como mínimo en algunos niveles
+    "niveles": [],                 # [{"nivel", "min", "max", "req_min", "precio"}]
     "premio_vendedor": "",
     "premio_lider": "",
     "participantes": [],           # lista por incentivo; vacía = todos los del Fanero
 }
 
 
+def limpiar_niveles(filas) -> list[dict]:
+    """Normaliza la tabla de niveles; ignora filas sin mínimo o sin precio."""
+    out = []
+    for f in filas or []:
+        try:
+            mn = int(float(f.get("min")))
+            pr = float(f.get("precio"))
+        except (TypeError, ValueError):
+            continue
+        mx = f.get("max")
+        mx = int(float(mx)) if mx not in (None, "") and not pd.isna(mx) else mn
+        rq = f.get("req_min")
+        rq = int(float(rq)) if rq not in (None, "") and not pd.isna(rq) else 0
+        nombre = str(f.get("nivel") or "").strip()
+        out.append({"nivel": nombre, "min": mn, "max": max(mx, mn), "req_min": rq, "precio": pr})
+    out.sort(key=lambda x: (x["min"], x["req_min"]))
+    for i, n in enumerate(out, 1):
+        n["nivel"] = n["nivel"] or f"Nivel {i}"
+    return out
+
+
 def completar_config(cfg: dict) -> dict:
     cfg = {**CONFIG_DEFECTO, **(cfg or {})}
     cfg["productos"] = [p for p in cfg.get("productos") or [] if p in PRODUCTOS] or ["PREPAGO"]
+    cfg["niveles"] = limpiar_niveles(cfg.get("niveles"))
+    if cfg.get("modo") == "niveles" and cfg["niveles"]:
+        base, req = cfg.get("nivel_base") or "PREPAGO", cfg.get("nivel_req") or ""
+        if base not in PRODUCTOS:
+            base = "PREPAGO"
+        cfg["nivel_base"] = base
+        cfg["nivel_req"] = req if req in PRODUCTOS and req != base else ""
+        for p in (base, cfg["nivel_req"]):
+            if p and p not in cfg["productos"]:
+                cfg["productos"].append(p)
+        # cuota = mínimo del nivel más bajo; el requisito se evalúa por nivel
+        q = min(n["min"] for n in cfg["niveles"])
+        cuotas = {p: 0 for p in cfg["productos"]}
+        cuotas[base] = q
+        cfg["cuotas_vendedor"], cfg["cuotas_lider"] = dict(cuotas), dict(cuotas)
+        cfg["gana_todos_cumplen"], cfg["gana_primeros_depto"], cfg["cupos"] = True, False, 0
+    else:
+        cfg["modo"] = "cuota"
     for clave in ("cuotas_vendedor", "cuotas_lider"):
         cfg[clave] = {p: int(cfg.get(clave, {}).get(p, 1) or 0) for p in cfg["productos"]}
     for clave in ("recargas_vendedor", "recargas_lider"):
@@ -672,22 +715,60 @@ def calcular(df: pd.DataFrame, cfg: dict, recargas: pd.DataFrame | None = None) 
     m["PUESTO_GENERAL"] = m["PUESTO_GENERAL"].astype("Int64")
     m["CUMPLE"] = m["CUMPLE"].map({True: "Sí", False: "No"})
     m["GANA"] = m["GANA"].map({True: "Sí", False: "No"})
-    orden = ["ROL", "DEPARTAMENTO"] + (["DIA"] if diaria else [])
     orden = ["ROL"] + (["DIA"] if diaria else [])
+    if cfg["modo"] == "niveles":
+        m = aplicar_niveles(m, cfg)
+        m = m.sort_values(orden + ["PAGO", "TOTAL_VENTAS"], ascending=[True] * len(orden) + [False, False])
+        return m.reset_index(drop=True)
     m = m.sort_values(orden + ["GANA", "PUESTO_GENERAL", "AVANCE_%"],
                       ascending=[True] * len(orden) + [False, True, False], na_position="last")
     return m.reset_index(drop=True)
 
 
+def aplicar_niveles(m: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Nivel = el más alto cuyo mínimo de base y requisito se cumplen.
+    Pago = min(ventas base, máximo del nivel) × precio del nivel."""
+    base, req = cfg["nivel_base"], cfg["nivel_req"]
+    vb = m[f"{base} VENTAS"].fillna(0).astype(int)
+    vr = m[f"{req} VENTAS"].fillna(0).astype(int) if req else pd.Series(0, index=m.index)
+    # cumple también lo demás que exija el incentivo (p. ej. recargas mínimas)
+    otros_ok = m["CUMPLE"] == "Sí"
+    nivel, pago, precio, unidades = [], [], [], []
+    for b, r, ok in zip(vb, vr, otros_ok):
+        elegido = None
+        if ok:
+            for n in cfg["niveles"]:
+                if b >= n["min"] and r >= n["req_min"]:
+                    elegido = n if (elegido is None or (n["min"], n["req_min"], n["precio"]) >=
+                                    (elegido["min"], elegido["req_min"], elegido["precio"])) else elegido
+        if elegido:
+            u = min(b, elegido["max"])
+            nivel.append(elegido["nivel"]); unidades.append(u); precio.append(elegido["precio"])
+            pago.append(round(u * elegido["precio"], 2))
+        else:
+            nivel.append(""); unidades.append(0); precio.append(0.0); pago.append(0.0)
+    pos = list(m.columns).index("CUMPLE")
+    for i, (c, v) in enumerate((("NIVEL", nivel), ("UNIDADES_PAGADAS", unidades),
+                                ("PRECIO_UNIT", precio), ("PAGO", pago))):
+        m.insert(pos + i, c, v)
+    m["CUMPLE"] = ["Sí" if n else "No" for n in nivel]
+    m["GANA"] = m["CUMPLE"]
+    m["MOTIVO"] = [f"{n}: {u} × S/ {p:g}" if n else "No llega al nivel más bajo" for n, u, p in
+                   zip(nivel, unidades, precio)]
+    m["PREMIO"] = [f"S/ {x:,.2f}" if x else "" for x in pago]
+    return m.drop(columns=["PUESTO_GENERAL", "PUESTO_DEPTO"], errors="ignore")
+
+
 def resumen(m: pd.DataFrame) -> pd.DataFrame:
     if m.empty:
         return m
-    return (m.groupby(["ROL", "DEPARTAMENTO"])
-            .agg(PARTICIPANTES=("DNI", "nunique"),
-                 VENTAS=("TOTAL_VENTAS", "sum"),
-                 CUMPLEN=("CUMPLE", lambda s: (s == "Sí").sum()),
-                 GANADORES=("GANA", lambda s: (s == "Sí").sum()))
-            .reset_index())
+    agg = dict(PARTICIPANTES=("DNI", "nunique"),
+               VENTAS=("TOTAL_VENTAS", "sum"),
+               CUMPLEN=("CUMPLE", lambda s: (s == "Sí").sum()),
+               GANADORES=("GANA", lambda s: (s == "Sí").sum()))
+    if "PAGO" in m:
+        agg["TOTAL_A_PAGAR"] = ("PAGO", "sum")
+    return m.groupby(["ROL", "DEPARTAMENTO"]).agg(**agg).reset_index()
 
 
 def reglas_tabla(cfg: dict) -> pd.DataFrame:
@@ -698,7 +779,7 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
             continue
         if k == "participantes":
             v = f"{len(v)} en lista" if v else "Todos los del Fanero"
-        elif k in ("planes", "origenes"):
+        elif k in ("planes", "origenes", "niveles"):
             continue
         elif isinstance(v, dict):
             v = ", ".join(f"{p}: {n}" for p, n in v.items())
@@ -706,6 +787,11 @@ def reglas_tabla(cfg: dict) -> pd.DataFrame:
             v = ", ".join(map(str, v))
         filas.append((k, v))
     filas.append(("planes", "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()) or "Todos"))
+    if cfg["modo"] == "niveles":
+        for n in cfg["niveles"]:
+            req = f" + {cfg['nivel_req']} ≥ {n['req_min']}" if cfg["nivel_req"] and n["req_min"] else ""
+            filas.append((n["nivel"], f"{cfg['nivel_base']} {n['min']} a {n['max']}{req} · S/ {n['precio']:g} c/u · "
+                                      f"máx. S/ {n['max'] * n['precio']:,.2f}"))
     filas.append(("origen_postpago", ", ".join(cfg["origenes"].get("POSTPAGO", [])) or "Todos (venta regular, OPP y OSS)"))
     filas.append(("recargas", "Consolidado, columna T (UR's). PREPAGO = UR's; PORTA PREPAGO = UR PORTA PP. "
                   "Sin hora: cuenta el día completo"))
