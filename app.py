@@ -70,7 +70,7 @@ def matriz_cacheada(cfg_json: str, version: int):
     en_rango = core.filtrar(ventas, cfg)
     mask = pd.Series(False, index=en_rango.index)
     for p in cfg["productos"]:
-        mask |= core.mascara_producto(en_rango, p, cfg["planes"].get(p))
+        mask |= core.mascara_producto(en_rango, p, cfg["planes"].get(p), cfg["origenes"].get(p))
     rec = recargas_cacheadas(cfg["fecha_inicio"], cfg["fecha_fin"], version) if core.usa_recargas(cfg) else None
     return core.calcular(ventas, cfg, rec), int(mask.sum())
 
@@ -168,6 +168,9 @@ with tab_carga:
                 with st.expander("Vista previa"):
                     st.dataframe(df.head(50), width="stretch")
                     st.write("Ventas por estado:", df["STATUS"].value_counts().to_dict())
+                    post = df[df["TIPO ACTIVACION"] == "POSTPAGO"]
+                    if not post.empty:
+                        st.write("Postpago por origen:", core.origen_postpago(post).value_counts().to_dict())
                 if st.button("Guardar en la base", type="primary"):
                     with st.spinner("Guardando..."):
                         r = db.guardar_ventas(eng, df, archivo.name)
@@ -291,7 +294,7 @@ with tab_inc:
             enc[1].markdown("Cuota vendedor")
             enc[2].markdown("Cuota líder (equipo)")
             enc[3].markdown("Planes que cuentan (vacío = todos)")
-            elegidos, cuotas_v, cuotas_l, planes_sel = [], {}, {}, {}
+            elegidos, cuotas_v, cuotas_l, planes_sel, origenes_sel = [], {}, {}, {}, {}
             for p in core.PRODUCTOS:
                 f = st.columns([1.3, 1, 1, 3])
                 marcado = f[0].checkbox(p.title(), p in cfg0["productos"], key=f"{clave_form}_{p}")
@@ -304,6 +307,17 @@ with tab_inc:
                 pl = f[3].multiselect("Planes", opciones_plan, default=previos,
                                       key=f"{clave_form}_pl_{p}", label_visibility="collapsed",
                                       placeholder="Todos los planes")
+                if p == "POSTPAGO":
+                    fo = st.columns([1.3, 2, 3])
+                    fo[0].caption("↳ Origen postpago")
+                    fo[1].caption("Venta regular = sin portabilidad · OPP · OSS (columna O, PORTABILIDAD)")
+                    orig = fo[2].multiselect("Origen postpago", core.ORIGENES_POSTPAGO,
+                                             default=[o for o in cfg0["origenes"].get("POSTPAGO", [])
+                                                      if o in core.ORIGENES_POSTPAGO],
+                                             key=f"{clave_form}_orig", label_visibility="collapsed",
+                                             placeholder="Todos los orígenes")
+                    if marcado and orig:
+                        origenes_sel["POSTPAGO"] = orig
                 if marcado:
                     elegidos.append(p)
                     cuotas_v[p], cuotas_l[p] = int(qv), int(ql)
@@ -314,6 +328,10 @@ with tab_inc:
             st.caption("Cuántas de esas ventas deben estar recargadas. Respeta fechas, planes y departamentos "
                        "del incentivo; el Consolidado no tiene hora, así que cuenta el día completo. "
                        "Sube el Consolidado en Cargar ventas.")
+            enc_r = st.columns([1.3, 1, 1, 3])
+            enc_r[0].markdown("Producto")
+            enc_r[1].markdown("Mín. recargadas vendedor")
+            enc_r[2].markdown("Mín. recargadas líder")
             rec_v, rec_l = {}, {}
             for p in core.RECARGABLES:
                 f = st.columns([1.3, 1, 1, 3])
@@ -396,7 +414,7 @@ with tab_inc:
             else:
                 cfg = dict(nombre=nombre.strip(), fecha_inicio=str(fechas[0]), fecha_fin=str(fechas[1]),
                            hora_desde=h1, hora_hasta=h2, evaluacion=evaluacion, estados=estados,
-                           departamentos=deptos, productos=elegidos, planes=planes_sel,
+                           departamentos=deptos, productos=elegidos, planes=planes_sel, origenes=origenes_sel,
                            cuotas_vendedor=cuotas_v, cuotas_lider=cuotas_l,
                            recargas_vendedor={k: v for k, v in rec_v.items() if k in elegidos},
                            recargas_lider={k: v for k, v in rec_l.items() if k in elegidos},
@@ -429,6 +447,8 @@ def describir(cfg: dict) -> str:
         partes.append("cuota diaria")
     if cfg["planes"]:
         partes.append("📋 " + "; ".join(f"{p}: {', '.join(v)}" for p, v in cfg["planes"].items()))
+    if cfg["origenes"].get("POSTPAGO"):
+        partes.append("🔀 postpago: " + ", ".join(cfg["origenes"]["POSTPAGO"]))
     if cfg["recargas_vendedor"] or cfg["recargas_lider"]:
         r = [f"vendedor {p} {n}" for p, n in cfg["recargas_vendedor"].items()]
         r += [f"líder {p} {n}" for p, n in cfg["recargas_lider"].items()]
