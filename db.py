@@ -104,7 +104,7 @@ def guardar_ventas(eng, df_norm: pd.DataFrame, archivo: str) -> dict:
 
 # columnas que usa el cálculo (traer menos datos de Neon = carga más rápida)
 COLS_CALCULO = ["status", "requeststarthour", "fecha", "fecha_hora", "login", "leader",
-                "department", "tipo_activacion", "producto", "tariffplanname"]
+                "department", "tipo_activacion", "producto", "tariffplanname", "portabilidad"]
 
 
 def leer_ventas(eng, desde=None, hasta=None, columnas=None) -> pd.DataFrame:
