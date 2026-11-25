@@ -449,6 +449,12 @@ with tab_inc:
             niveles_sel = core.limpiar_niveles(tabla_niv.to_dict("records")) if modo == "niveles" else []
             if modo == "niveles" and not niveles_sel:
                 errores.append("En modo por niveles, completa al menos un nivel con mínimo y precio.")
+            if modo == "niveles" and niveles_sel:
+                raros = core.niveles_desconocidos(participantes, niveles_sel)
+                if raros:
+                    errores.append("La lista de participantes trae niveles que no están en la tabla: "
+                                   + ", ".join(raros) + ". Usa el mismo nombre (ej. Nivel 3) o solo el número.")
+
             if modo == "cuota" and not (g_todos or g_prim):
                 errores.append("Marca al menos una forma de ganar.")
             if errores:
@@ -592,6 +598,8 @@ with tab_res:
                     "PUESTO_DEPTO": st.column_config.NumberColumn("Puesto depto"),
                     "PUESTO_GENERAL": st.column_config.NumberColumn("Puesto general"),
                     "PAGO": st.column_config.NumberColumn("Pago (S/)", format="%.2f"),
+                    "NIVEL_ASIGNADO": st.column_config.TextColumn("Nivel asignado"),
+                    "NIVEL": st.column_config.TextColumn("Nivel alcanzado"),
                     "PRECIO_UNIT": st.column_config.NumberColumn("Precio unit. (S/)", format="%.2f"),
                     "AVANCE_%": st.column_config.ProgressColumn("Avance (lo más atrasado)", format="%.0f%%",
                                                                 min_value=0, max_value=100),
