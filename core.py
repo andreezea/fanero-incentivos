@@ -269,17 +269,17 @@ def normalizar_consolidado(df: pd.DataFrame, mes: int, anio: int) -> pd.DataFram
 # --------------------------------------------------------------------------- #
 # Participantes
 # --------------------------------------------------------------------------- #
-COLS_PARTICIPANTES = (["DNI", "NOMBRE", "ROL", "DEPARTAMENTO", "DNI_LIDER"]
+COLS_PARTICIPANTES = (["DNI", "NOMBRE", "ROL", "DEPARTAMENTO", "DNI_LIDER", "NIVEL"]
                       + [f"CUOTA_{slug(p)}" for p in PRODUCTOS]
                       + [f"RECARGA_{slug(p)}" for p in RECARGABLES])
 
 
 def plantilla_participantes() -> bytes:
     ejemplo = pd.DataFrame([
-        ["40854375", "Juan Pérez", "Vendedor", "LORETO", "41544805", 5, "", 2, "", "", ""],
-        ["62300640", "María Ríos", "Vendedor", "LORETO", "41544805", "", "", "", "", "", ""],
-        ["", "", "Vendedor", "", "40687294", 15, "", "", "", 3, ""],
-        ["41544805", "Carlos Soto", "Líder", "LORETO", "", 30, "", 10, "", "", ""],
+        ["40854375", "Juan Pérez", "Vendedor", "LORETO", "41544805", "Nivel 3", 5, "", 2, "", "", ""],
+        ["62300640", "María Ríos", "Vendedor", "LORETO", "41544805", "Nivel 5", "", "", "", "", "", ""],
+        ["", "", "Vendedor", "", "40687294", "", 15, "", "", "", 3, ""],
+        ["41544805", "Carlos Soto", "Líder", "LORETO", "", "", 30, "", 10, "", "", ""],
     ], columns=COLS_PARTICIPANTES)
     instrucciones = pd.DataFrame([
         ["DNI", "Obligatorio*", "El número que sale en LOGIN (vendedor) o LEADER (líder) del Fanero. "
@@ -294,6 +294,9 @@ def plantilla_participantes() -> bytes:
         ["CUOTA_POSTPAGO", "Opcional", "Cuota individual de postpago (TIPO ACTIVACION = POSTPAGO). Vacío = cuota general"],
         ["CUOTA_PORTA_PREPAGO", "Opcional", "Cuota individual de porta prepago (PRODUCTO = PORTA PREPAGO). Vacío = cuota general"],
         ["CUOTA_OSS", "Opcional", "Cuota individual de OSS (PRODUCTO = OSS). Vacío = cuota general"],
+        ["NIVEL", "Solo incentivos por niveles", "Nivel asignado en el táctico (ej. Nivel 3 o 3). Es el piso: "
+                                                 "si llega o lo supera cobra según el nivel que alcanzó; si no llega, "
+                                                 "no cobra. Vacío = sin nivel asignado (cobra el que alcance)"],
         ["RECARGA_PREPAGO", "Opcional", "Mínimo de prepagos recargados (Consolidado, columna T). "
                                         "Vacío = el mínimo general del incentivo"],
         ["RECARGA_PORTA_PREPAGO", "Opcional", "Mínimo de porta prepago recargadas (Consolidado, UR PORTA PP). "
@@ -320,6 +323,7 @@ def leer_participantes(nombre: str, contenido: bytes) -> tuple[list[dict], list[
     df["DNI"] = _limpiar_id(df["DNI"])
     df["DNI_LIDER"] = _limpiar_id(df["DNI_LIDER"])
     df["NOMBRE"] = _txt(df["NOMBRE"])
+    df["NIVEL"] = _txt(df["NIVEL"])
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].map(sin_tildes)
     rol = df["ROL"].map(sin_tildes)
     df["ROL"] = rol.map(lambda r: "Vendedor" if r.startswith("VEND") else ("Líder" if r.startswith("LID") else None))
@@ -398,6 +402,20 @@ CONFIG_DEFECTO = {
     "premio_lider": "",
     "participantes": [],           # lista por incentivo; vacía = todos los del Fanero
 }
+
+
+def clave_nivel(texto) -> str:
+    """'Nivel 3', 'NIVEL 3', 'nivel3' y '3' se tratan igual."""
+    t = sin_tildes(texto).replace(" ", "")
+    if t.endswith(".0"):
+        t = t[:-2]
+    return f"NIVEL{t}" if t.isdigit() else t
+
+
+def niveles_desconocidos(participantes: list, niveles: list) -> list[str]:
+    validos = {clave_nivel(n["nivel"]) for n in limpiar_niveles(niveles)}
+    return sorted({str(p.get("NIVEL")) for p in participantes or []
+                   if p.get("NIVEL") and clave_nivel(p["NIVEL"]) not in validos})
 
 
 def limpiar_niveles(filas) -> list[dict]:
@@ -538,20 +556,24 @@ def _personas(universo: pd.DataFrame, rol: str, cfg: dict) -> pd.DataFrame:
                                                 base["LIDER_FANERO"]).fillna("")
         for p in cfg["productos"]:
             ind = pd.to_numeric(base[f"CUOTA_{slug(p)}"], errors="coerce")
+            if cfg.get("modo") == "niveles":
+                ind = ind * float("nan")   # en niveles mandan los rangos, no las cuotas de la lista
             base[f"Q_{p}"] = ind.fillna(general[p]).astype(int)
         for p in rec_general:
             ind = pd.to_numeric(base[f"RECARGA_{slug(p)}"], errors="coerce")
             base[f"RQ_{p}"] = ind.fillna(rec_general[p]).astype(int)
+        base["NIVEL_ASIGNADO"] = base["NIVEL"].fillna("")
     else:
         base = info.rename(columns={"DEPTO_FANERO": "DEPARTAMENTO", "LIDER_FANERO": "LIDER"})
         base["NOMBRE"] = ""
+        base["NIVEL_ASIGNADO"] = ""
         for p in cfg["productos"]:
             base[f"Q_{p}"] = int(general[p])
         for p in rec_general:
             base[f"RQ_{p}"] = int(rec_general[p])
     if rol == "Líder":
         base["LIDER"] = ""
-    return base[["DNI", "NOMBRE", "DEPARTAMENTO", "LIDER"] + [f"Q_{p}" for p in cfg["productos"]]
+    return base[["DNI", "NOMBRE", "DEPARTAMENTO", "LIDER", "NIVEL_ASIGNADO"] + [f"Q_{p}" for p in cfg["productos"]]
                 + [f"RQ_{p}" for p in rec_general]]
 
 
@@ -696,7 +718,9 @@ def calcular(df: pd.DataFrame, cfg: dict, recargas: pd.DataFrame | None = None) 
     m = pd.concat(partes, ignore_index=True)
 
     diaria = cfg["evaluacion"] == "diaria"
-    renombre, cols = {}, ["ROL", "DNI", "NOMBRE", "DEPARTAMENTO", "LIDER"] + (["DIA"] if diaria else [])
+    renombre, cols = {}, (["ROL", "DNI", "NOMBRE", "DEPARTAMENTO", "LIDER"]
+                          + (["NIVEL_ASIGNADO"] if cfg["modo"] == "niveles" else [])
+                          + (["DIA"] if diaria else []))
     for p in cfg["productos"]:
         renombre[f"V_{p}"] = f"{p} VENTAS"
         renombre[f"Q_{p}"] = f"{p} CUOTA"
@@ -733,18 +757,35 @@ def aplicar_niveles(m: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     vr = m[f"{req} VENTAS"].fillna(0).astype(int) if req else pd.Series(0, index=m.index)
     # cumple también lo demás que exija el incentivo (p. ej. recargas mínimas)
     otros_ok = m["CUMPLE"] == "Sí"
-    nivel, pago, precio, unidades = [], [], [], []
-    for b, r, ok in zip(vb, vr, otros_ok):
+    rango = {clave_nivel(n["nivel"]): i for i, n in enumerate(cfg["niveles"])}
+    asignados = m["NIVEL_ASIGNADO"].fillna("") if "NIVEL_ASIGNADO" in m else pd.Series("", index=m.index)
+    nivel, pago, precio, unidades, motivo = [], [], [], [], []
+    for b, r, ok, asig in zip(vb, vr, otros_ok, asignados):
         elegido = None
         if ok:
             for n in cfg["niveles"]:
                 if b >= n["min"] and r >= n["req_min"]:
                     elegido = n if (elegido is None or (n["min"], n["req_min"], n["precio"]) >=
                                     (elegido["min"], elegido["req_min"], elegido["precio"])) else elegido
+        piso = rango.get(clave_nivel(asig)) if asig else None
+        if elegido and piso is not None and rango[clave_nivel(elegido["nivel"])] < piso:
+            n_asig = cfg["niveles"][piso]
+            motivo.append(f"No llega a su nivel asignado ({n_asig['nivel']}: mín. {n_asig['min']} {base}"
+                          + (f" + {n_asig['req_min']} {req}" if req and n_asig["req_min"] else "")
+                          + f"); alcanzó {elegido['nivel']}")
+            elegido = None
+        elif not elegido:
+            if piso is not None:
+                n_asig = cfg["niveles"][piso]
+                motivo.append(f"No llega a su nivel asignado ({n_asig['nivel']}: mín. {n_asig['min']} {base}"
+                              + (f" + {n_asig['req_min']} {req}" if req and n_asig["req_min"] else "") + ")")
+            else:
+                motivo.append("No llega al nivel más bajo")
         if elegido:
             u = min(b, elegido["max"])
             nivel.append(elegido["nivel"]); unidades.append(u); precio.append(elegido["precio"])
             pago.append(round(u * elegido["precio"], 2))
+            motivo.append(f"{elegido['nivel']}: {u} × S/ {elegido['precio']:g}")
         else:
             nivel.append(""); unidades.append(0); precio.append(0.0); pago.append(0.0)
     pos = list(m.columns).index("CUMPLE")
@@ -753,8 +794,7 @@ def aplicar_niveles(m: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         m.insert(pos + i, c, v)
     m["CUMPLE"] = ["Sí" if n else "No" for n in nivel]
     m["GANA"] = m["CUMPLE"]
-    m["MOTIVO"] = [f"{n}: {u} × S/ {p:g}" if n else "No llega al nivel más bajo" for n, u, p in
-                   zip(nivel, unidades, precio)]
+    m["MOTIVO"] = motivo
     m["PREMIO"] = [f"S/ {x:,.2f}" if x else "" for x in pago]
     return m.drop(columns=["PUESTO_GENERAL", "PUESTO_DEPTO"], errors="ignore")
 
